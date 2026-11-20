@@ -1,0 +1,41 @@
+# fly.toml — Fly.io config for Job Hunter v3
+# Free tier: 2 shared-cpu VMs + 3 GB persistent volume (always-on, no sleep)
+# Deploy: flyctl deploy  (from this folder)
+
+app     = "job-hunter"      # change to your preferred app name
+primary_region = "sin"      # Singapore — closest to India
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST                   = "0.0.0.0"
+  PORT                   = "8080"
+  SCAN_INTERVAL_MINUTES  = "30"
+  # Set secrets separately: flyctl secrets set GEMINI_API_KEY=xxx FIRECRAWL_API_URL=https://...
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = false   # KEEP RUNNING 24/7 — do not sleep
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"   # free tier VM
+
+[[mounts]]
+  source      = "job_hunter_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[checks]
+  [checks.health]
+    type         = "http"
+    port         = 8080
+    grace_period = "30s"
+    interval     = "30s"
+    method       = "get"
+    path         = "/api/stats"
+    protocol     = "http"
+    timeout      = "5s"

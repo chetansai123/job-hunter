@@ -1,0 +1,15 @@
+# railway.json — Railway.app config (alternative to Fly.io)
+# Free $5/month credit — enough to run a small Python app continuously
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE"
+  },
+  "deploy": {
+    "startCommand": "python3 job_hunter.py --serve --host 0.0.0.0",
+    "healthcheckPath": "/api/stats",
+    "healthcheckTimeout": 10,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}

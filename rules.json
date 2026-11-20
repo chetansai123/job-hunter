@@ -1,0 +1,134 @@
+{
+  "profile": {
+    "experience_years": 2.2,
+    "previous_company": "Oracle",
+    "notice_period": "Immediate joiner",
+    "previous_ctc_lpa": 21,
+    "location": "India",
+    "primary_stack": [
+      "JavaScript",
+      "TypeScript",
+      "React.js",
+      "Node.js",
+      "Express.js",
+      "Next.js",
+      "MongoDB",
+      "SQL",
+      "PostgreSQL",
+      "MySQL",
+      "REST APIs"
+    ],
+    "open_to": ["Full Stack", "Backend", "Frontend"]
+  },
+  "role_priority": [
+    "Full Stack Developer",
+    "Full Stack Engineer",
+    "Backend Developer",
+    "Backend Engineer",
+    "Frontend Developer",
+    "Frontend Engineer",
+    "Software Engineer",
+    "React Developer",
+    "Node.js Developer",
+    "Web Software Engineer",
+    "Product Engineer"
+  ],
+  "keywords": [
+    "JavaScript",
+    "TypeScript",
+    "React",
+    "Node.js",
+    "Express.js",
+    "Next.js",
+    "MongoDB",
+    "SQL",
+    "PostgreSQL",
+    "MySQL",
+    "REST API"
+  ],
+  "experience": {
+    "ideal_min": 2,
+    "ideal_max": 4,
+    "acceptable_min": 1,
+    "acceptable_max": 3,
+    "reject_min_yoe_at_or_above": 4,
+    "reject_title_keywords": [
+      "senior",
+      "sr.",
+      "sr ",
+      "staff",
+      "lead",
+      "principal",
+      "architect",
+      "manager",
+      "director",
+      "head of",
+      "vp ",
+      "intern",
+      "internship",
+      "fresher",
+      "graduate trainee",
+      "trainee",
+      "0-1 year"
+    ]
+  },
+  "locations": {
+    "allowed_india_cities": ["Hyderabad", "Bengaluru", "Bangalore", "Pune"],
+    "allow_remote_india": true,
+    "allow_remote_worldwide_india_eligible": true,
+    "allow_remote_apac_india_eligible": true,
+    "reject_region_phrases": [
+      "us only",
+      "usa only",
+      "united states only",
+      "eu only",
+      "europe only",
+      "uk only",
+      "latam only",
+      "canada only",
+      "must reside in the us",
+      "us work authorization required",
+      "no visa sponsorship"
+    ]
+  },
+  "compensation": {
+    "india_min_lpa": 15,
+    "reject_unpaid": true,
+    "reject_equity_only": true,
+    "international_usd_min": null
+  },
+  "excluded_companies": [
+    "Oracle",
+    "Amazon",
+    "Razorpay",
+    "FactSet",
+    "Postman"
+  ],
+  "excluded_platforms": [
+    "upwork.com",
+    "turing.com",
+    "micro1.ai",
+    "fiverr.com",
+    "freelancer.com"
+  ],
+  "freshness": {
+    "priority_days": 14,
+    "max_age_days": 40
+  },
+  "sources": {
+    "career_urls": [
+      "https://www.ycombinator.com/jobs/role/full-stack-engineer",
+      "https://wellfound.com/role/r/full-stack-engineer",
+      "https://remoteok.com/remote-javascript-jobs",
+      "https://remotive.com/remote-jobs/software-dev",
+      "https://weworkremotely.com/categories/remote-full-stack-programming-jobs"
+    ],
+    "discovery_queries": [
+      "\"Full Stack\" \"TypeScript\" \"Node.js\" remote India OR worldwide hiring",
+      "\"Backend Engineer\" \"Node.js\" \"TypeScript\" Hyderabad OR Bengaluru OR Pune",
+      "\"Frontend Engineer\" \"React\" \"Next.js\" \"TypeScript\" remote India",
+      "site:linkedin.com/posts \"hiring\" \"Full Stack\" \"TypeScript\" \"React\" \"Node\" remote OR Bengaluru OR Hyderabad",
+      "site:ycombinator.com/companies \"Full Stack\" \"TypeScript\" remote"
+    ]
+  }
+}
