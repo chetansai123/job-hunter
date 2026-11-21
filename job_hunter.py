@@ -358,10 +358,19 @@ def looks_like_listing(url: str) -> bool:
     path = p.path or "/"
     if path in ("", "/"):
         return True
+    if "gh_jid" in p.query:
+        return False                                          # company-hosted Greenhouse posting
+    host = _netloc(url)
+    segs = [x for x in path.split("/") if x]
     if ats_board_from_url(url):
-        segs = [x for x in path.split("/") if x]
-        return len(segs) < 2 and "gh_jid" not in p.query     # board root, not a posting
-    return bool(_LISTING_PATH.search(path))
+        return len(segs) < 2                                  # board root, not a posting
+    if host == "apply.workable.com":
+        return len(segs) < 3                                  # /slug/j/<id> is the posting
+    if host in ("jobs.smartrecruiters.com", "careers.smartrecruiters.com", "ats.rippling.com", "jobs.gem.com"):
+        return len(segs) < 2 or (host == "ats.rippling.com" and len(segs) < 3)
+    if host.endswith((".bamboohr.com", ".applytojob.com")) and len(segs) < 2:
+        return True
+    return bool(_LISTING_PATH.search(path)) or bool(re.search(r"/(?:jobs|careers|positions|openings|open-positions|join-us|join-the-team)/?$", path, re.I))
 
 
 def looks_like_job_page(url: str) -> bool:
@@ -2386,11 +2395,31 @@ def ats_board_from_url(url: str) -> tuple[str, str] | None:
     return None
 
 
+_GENERIC_SUB = {"careers", "jobs", "apply", "www", "job", "career", "hire", "hiring", "join", "work", "talent", "boards",
+                "ats", "app", "recruit", "people", "team", "en", "in"}
+_PATH_SLUG_HOSTS = ("apply.workable.com", "jobs.smartrecruiters.com", "careers.smartrecruiters.com", "ats.rippling.com",
+                    "jobs.gem.com", "jobs.jobvite.com", "app.trinethire.com", "jobs.polymer.co")
+_SUB_SLUG_DOMAINS = ("bamboohr.com", "applytojob.com", "breezy.hr", "recruitee.com", "teamtailor.com", "workable.com",
+                     "myworkdayjobs.com", "keka.com", "freshteam.com", "zohorecruit.com", "pinpointhq.com")
+
+
 def company_from_url(url: str) -> str:
     b = ats_board_from_url(url)
     if b:
         return b[1].replace("-", " ").replace("_", " ").title()
-    return _netloc(url).split(".")[0].title()
+    host = _netloc(url)
+    if host in _PATH_SLUG_HOSTS:
+        seg = next((x for x in urllib.parse.urlparse(url).path.split("/") if x), "")
+        if seg:
+            return seg.replace("-", " ").replace("_", " ").title()
+    parts = host.split(".")
+    if any(host.endswith("." + d) for d in _SUB_SLUG_DOMAINS) and len(parts) > 2:
+        return parts[0].replace("-", " ").title()
+    labels = [x for x in parts[:-1] if x not in _GENERIC_SUB]
+    # registrable label (handles co.in / com.au style suffixes)
+    if len(labels) >= 2 and labels[-1] in ("co", "com", "org", "net", "gov"):
+        labels = labels[:-1]
+    return (labels[-1] if labels else parts[0]).replace("-", " ").title()
 
 
 def register_board(conn: sqlite3.Connection, url: str, source: str = "") -> None:
@@ -2643,6 +2672,61 @@ def resolve_direct(company: str, title: str, rules: dict | None = None) -> tuple
     return None
 
 
+_SITE_RES_CACHE: dict[tuple[str, str], tuple[str, str] | None] = {}
+
+
+def resolve_via_site(company: str, title: str, rules: dict | None = None) -> tuple[str, str] | None:
+    """Fallback for companies on no supported ATS: open their own website's careers page, find the exact job link
+    (or an ATS board linked from it) → (url, location)."""
+    import difflib
+    key = (_company_key(company), _norm_title(title))
+    if key in _SITE_RES_CACHE:
+        return _SITE_RES_CACHE[key]
+    result = None
+    try:
+        found = _find_company_site(company)
+        if found:
+            base, home = found
+            want = _norm_title(title)
+            want_lv = set(_LEVEL_TOKENS.findall(want))
+            pages = [(base, home)]
+            for pth in ("/careers", "/jobs", "/join-us", "/company/careers", "/about/careers", "/careers/open-positions"):
+                h = http_get_text(base.rstrip("/") + pth, timeout=6, quiet=True)
+                if h and len(h) > 600:
+                    pages.append((base.rstrip("/") + pth, h))
+            if _CHROME:                                   # careers pages are often JS-rendered → also try the real browser
+                for pth in ("/careers", "/jobs"):
+                    dom = chrome_render(base.rstrip("/") + pth, 8000)
+                    if dom and len(dom) > 1500 and not any(ch in dom.lower()[:1500] for ch in _CHALLENGE):
+                        pages.append((base.rstrip("/") + pth, dom))
+            for page_url, h in pages:
+                for href, anchor in re.findall(r'<a\b[^>]*?href="([^"#][^"]*)"[^>]*>(.*?)</a>', h, re.S | re.I):
+                    u = urllib.parse.urljoin(page_url, htmllib.unescape(href))
+                    txt = _norm_title(re.sub(r"<[^>]+>", " ", htmllib.unescape(anchor)))
+                    head = txt[:len(want) + 3].strip()              # card text = title + teaser; compare the title part only
+                    if head and set(_LEVEL_TOKENS.findall(head)) == want_lv and (
+                            head.startswith(want) or difflib.SequenceMatcher(None, want, head[:len(want)]).ratio() >= 0.95) \
+                            and u.startswith("http") and not bad_apply_target(u):
+                        result = (u, "")
+                        break
+                    ab = ats_board_from_url(u)
+                    if ab and not result and ab[0] in ("greenhouse", "lever", "ashby"):
+                        posts = _ats_postings(ab[0], ab[1]) or []
+                        for tt, uu, loc in posts:
+                            nt = _norm_title(tt)
+                            if uu and set(_LEVEL_TOKENS.findall(nt)) == want_lv and difflib.SequenceMatcher(None, want, nt).ratio() >= 0.95:
+                                result = (uu, loc)
+                                break
+                    if result:
+                        break
+                if result:
+                    break
+    except Exception:
+        result = None
+    _SITE_RES_CACHE[key] = result
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  FULL-JD VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2741,7 +2825,7 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     apply_email = ""
     if link_type == "board":
         # third-party board page: only keep the role if we can reach the company's own posting, or the JD says "email us"
-        res = resolve_direct(job["company"], job["title"], rules)
+        res = resolve_direct(job["company"], job["title"], rules) or resolve_via_site(job["company"], job["title"], rules)
         if res:
             direct2, ats_loc = res
             ptxt = _posting_text(direct2)
