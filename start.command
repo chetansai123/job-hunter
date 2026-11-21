@@ -7,6 +7,10 @@
 # Always run from the script's own directory
 cd "$(dirname "$0")"
 
+# ── 0. Silently sync latest 24/7 jobs discovered by GitHub Actions ─
+echo "☁️  Syncing latest jobs from cloud..."
+git pull --quiet origin main 2>/dev/null || true
+
 FIRECRAWL_PORT=3002
 DASHBOARD_PORT=8080
 LOG_DIR="$(pwd)/logs"
@@ -59,7 +63,7 @@ fi
 
 # ── 3. Start the Python dashboard + background discovery loop ─────
 echo "🐍  Starting job_hunter.py --serve on port $DASHBOARD_PORT..."
-python3 job_hunter.py --serve --port $DASHBOARD_PORT \
+python3 -u job_hunter.py --serve --port $DASHBOARD_PORT \
     >> "$LOG_DIR/job_hunter.log" 2>&1 &
 JH_PID=$!
 echo "    PID $JH_PID — log: logs/job_hunter.log"
