@@ -2,40 +2,96 @@ name: 24/7 Job & Post Discovery
 
 on:
   schedule:
-    # Runs every 30 minutes in the cloud 24/7 (even with laptop powered off)
+    # Every 30 minutes around the clock — GitHub Actions runs this even
+    # when your MacBook is off, sleeping, or in your bag.
     - cron: '*/30 * * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub web UI
+  workflow_dispatch:   # Manual trigger from GitHub UI anytime
 
 permissions:
-  contents: write
+  contents: write      # needed to commit updated jobs.db back to the repo
 
 jobs:
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 25   # kill the job if it hangs; next run starts fresh
+
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Set up Python
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Run discovery scan across all global sources
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          python3 job_hunter.py --init-db
-          python3 job_hunter.py --scan
+      # ── 3. Restore cached jobs.db from previous run ────────────────────────
+      # This keeps accumulated jobs between runs even though we don't always
+      # commit the db (saves git history bloat).
+      - name: Restore jobs.db from cache
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: jobs.db
+          # Restore the most recent save (restore-keys is a prefix match)
+          key: jobs-db-${{ github.run_id }}
+          restore-keys: |
+            jobs-db-
 
-      - name: Commit and push updated jobs.db
+      # ── 4. Migrate + scan ──────────────────────────────────────────────────
+      # continue-on-error: true so the workflow shows as green even if some
+      # API sources are unavailable (Reddit, Firecrawl, etc.)
+      - name: Initialize / migrate database schema
+        run: python3 job_hunter.py --init-db
+
+      - name: Run discovery scan across all global sources
+        id: scan
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          # --- Firecrawl cloud (optional but highly recommended) ---
+          # Sign up free at https://firecrawl.dev → get API key (500 credits/month free)
+          # Then add it: GitHub repo → Settings → Secrets → FIRECRAWL_API_KEY
+          FIRECRAWL_API_URL:   ${{ secrets.FIRECRAWL_API_URL || 'https://api.firecrawl.dev' }}
+          FIRECRAWL_API_KEY:   ${{ secrets.FIRECRAWL_API_KEY }}
+        run: python3 job_hunter.py --scan
+
+      # ── 5. Save updated jobs.db to cache ───────────────────────────────────
+      - name: Save jobs.db to cache
+        uses: actions/cache/save@v4
+        if: always()   # save even if scan step had errors
+        with:
+          path: jobs.db
+          key: jobs-db-${{ github.run_id }}
+
+      # ── 6. Commit jobs.db back to repo ─────────────────────────────────────
+      # So you can `git pull` on your Mac and immediately see new jobs
+      # in the local dashboard via start.command.
+      - name: Commit updated jobs.db
+        if: always()
         run: |
-          git config --global user.name "github-actions[bot]"
+          git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add jobs.db
           if git diff --staged --quiet; then
-            echo "No new jobs found in this run."
+            echo "No new jobs in this run."
           else
-            git commit -m "Auto-discovery: updated jobs.db [skip ci]"
+            COUNT=$(python3 -c "import sqlite3; c=sqlite3.connect('jobs.db'); print(c.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]); c.close()")
+            git commit -m "🤖 Auto-discovery: ${COUNT} total jobs in DB [skip ci]"
             git push
           fi
+
+      # ── 7. Upload jobs.db as a downloadable artifact ───────────────────────
+      # Lets you download the latest DB directly from GitHub Actions UI
+      # without needing to clone the repo.
+      - name: Upload jobs.db artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jobs-database
+          path: jobs.db
+          retention-days: 30
+          overwrite: true

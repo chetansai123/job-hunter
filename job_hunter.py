@@ -43,7 +43,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH   = Path(os.environ.get("DB_PATH",   str(BASE_DIR / "jobs.db")))
 RULES_PATH = BASE_DIR / "rules.json"
 
-FIRECRAWL_URL   = os.environ.get("FIRECRAWL_API_URL", "http://localhost:3002").rstrip("/")
+FIRECRAWL_URL      = os.environ.get("FIRECRAWL_API_URL", "http://localhost:3002").rstrip("/")
+FIRECRAWL_API_KEY  = os.environ.get("FIRECRAWL_API_KEY", "")   # set for cloud Firecrawl
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -159,6 +160,22 @@ def init_db() -> None:
         );
     """)
     conn.commit()
+
+    # ── Schema migrations: add columns that older DB files may be missing ──
+    # Safe to run on every startup — each ALTER is ignored if column exists.
+    _migrations = [
+        "ALTER TABLE scan_runs ADD COLUMN posts_added INTEGER DEFAULT 0",
+        "ALTER TABLE scan_runs ADD COLUMN urls_scanned INTEGER DEFAULT 0",
+        "ALTER TABLE jobs      ADD COLUMN notes TEXT DEFAULT ''",
+        "ALTER TABLE posts     ADD COLUMN location TEXT DEFAULT ''",
+    ]
+    for sql in _migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass   # column already exists — that's fine
+
     conn.close()
 
 
@@ -252,7 +269,43 @@ def best_apply_url(
 
 # ─────────────────────────── HTTP helpers ───────────────────────────────────
 
-_HEADERS = {"User-Agent": "JobHunterBot/3.0 (personal automation; not for commercial use)"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; JobHunterBot/3.0; +personal-automation)"}
+
+# ── Firecrawl availability cache ─────────────────────────────────────────────
+_FC_OK: bool | None = None   # None = not yet tested
+
+def _fc_available() -> bool:
+    """Return True if Firecrawl server (local or cloud) is reachable."""
+    global _FC_OK
+    if _FC_OK is not None:
+        return _FC_OK
+    # Cloud Firecrawl: if API key is set, assume cloud URL is reachable
+    if FIRECRAWL_API_KEY:
+        _FC_OK = True
+        print("[firecrawl] using cloud Firecrawl API")
+        return True
+    # Local Firecrawl: quick health check
+    try:
+        req = urllib.request.Request(
+            f"{FIRECRAWL_URL}/health",
+            headers={"User-Agent": "JobHunterBot/3.0"},
+        )
+        with urllib.request.urlopen(req, timeout=3):
+            _FC_OK = True
+            print("[firecrawl] local server is reachable")
+            return True
+    except Exception:
+        _FC_OK = False
+        print("[firecrawl] not reachable — Firecrawl-dependent sources will be skipped")
+        return False
+
+
+def _fc_headers() -> dict:
+    """Return headers for Firecrawl requests (adds Bearer token for cloud)."""
+    h = {"Content-Type": "application/json", "User-Agent": "JobHunterBot/3.0"}
+    if FIRECRAWL_API_KEY:
+        h["Authorization"] = f"Bearer {FIRECRAWL_API_KEY}"
+    return h
 
 
 def http_get(url: str, timeout: int = 20) -> dict | list:
@@ -275,13 +328,12 @@ def http_get_text(url: str, timeout: int = 20) -> str:
         return ""
 
 
-def http_post(url: str, payload: dict, timeout: int = 45) -> dict:
+def http_post(url: str, payload: dict, timeout: int = 45, extra_headers: dict | None = None) -> dict:
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={**_HEADERS, "Content-Type": "application/json"},
-        method="POST",
-    )
+    headers = {**_HEADERS, "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
@@ -293,20 +345,29 @@ def http_post(url: str, payload: dict, timeout: int = 45) -> dict:
 # ─────────────────────────── Firecrawl helpers ──────────────────────────────
 
 def fc_scrape(url: str) -> dict:
+    if not _fc_available():
+        return {}
     r = http_post(f"{FIRECRAWL_URL}/v2/scrape",
-                  {"url": url, "formats": ["markdown", "links"]}, timeout=60)
+                  {"url": url, "formats": ["markdown", "links"]},
+                  timeout=60, extra_headers=_fc_headers())
     return r.get("data", r)
 
 
 def fc_search(query: str, limit: int = 10) -> list[dict]:
+    if not _fc_available():
+        return []
     r = http_post(f"{FIRECRAWL_URL}/v2/search",
                   {"query": query, "limit": limit,
-                   "scrapeOptions": {"formats": ["markdown", "links"]}}, timeout=60)
+                   "scrapeOptions": {"formats": ["markdown", "links"]}},
+                  timeout=60, extra_headers=_fc_headers())
     return r.get("data", []) or []
 
 
 def fc_map(url: str, limit: int = 50) -> list[str]:
-    r = http_post(f"{FIRECRAWL_URL}/v2/map", {"url": url, "limit": limit})
+    if not _fc_available():
+        return []
+    r = http_post(f"{FIRECRAWL_URL}/v2/map", {"url": url, "limit": limit},
+                  extra_headers=_fc_headers())
     links = r.get("links") or r.get("data", {}).get("links") or []
     return [u for u in links if isinstance(u, str)]
 
@@ -808,21 +869,23 @@ def collect_weworkremotely(rules: dict) -> list[dict]:
 
 # ── 8. The Muse ─────────────────────────────────────────────────────────────
 def collect_the_muse(rules: dict) -> list[dict]:
-    """The Muse public API — no key needed for basic endpoint."""
+    """The Muse API v2 — updated endpoint (v1 returned 404)."""
     print("[themuse] fetching...")
     stack_kws = [k.lower() for k in rules.get("keywords", [])]
     out = []
-    for page in range(0, 3):   # 3 pages × 20 = 60 jobs
+    # Updated API endpoint (v2)
+    for page in range(0, 3):
         raw = http_get(
-            f"https://www.themuse.com/api/public/jobs?category=Engineering&level=Entry+Level"
-            f"&level=Mid+Level&page={page}&descending=true", timeout=20)
-        if not isinstance(raw, dict):
+            f"https://www.themuse.com/api/public/jobs"
+            f"?category=Engineer&level=Entry+Level&level=Mid+Level"
+            f"&page={page}&descending=true", timeout=20)
+        if not isinstance(raw, dict) or not raw.get("results"):
             break
         for item in raw.get("results", []):
             title   = item.get("name","")
-            company = item.get("company",{}).get("name","")
+            company = item.get("company",{}).get("name","") if isinstance(item.get("company"), dict) else ""
             refs    = item.get("refs",{})
-            p_url   = refs.get("landing_page","") or item.get("refs",{}).get("canonical_url","")
+            p_url   = refs.get("landing_page","") if isinstance(refs, dict) else ""
             if not title or not p_url:
                 continue
             combined = title.lower()
@@ -831,11 +894,9 @@ def collect_the_muse(rules: dict) -> list[dict]:
             ok, _ = passes_hard_filters(title, company, p_url, combined, rules)
             if not ok:
                 continue
-
             direct = best_apply_url(p_url)
             if not direct:
                 continue
-
             out.append(_job(company, title, direct, "themuse",
                             rules, body=combined,
                             reason=f"TheMuse · {title[:40]}"))
@@ -1035,9 +1096,25 @@ def collect_reddit_posts(rules: dict) -> list[dict]:
     stack_kws  = [k.lower() for k in rules.get("keywords", [])]
     max_days   = rules.get("freshness", {}).get("max_age_days", 40)
     out = []
+    # Reddit blocks datacenter IPs (GitHub Actions) with generic bot UAs.
+    # Use their old JSON API with a browser-like UA — most reliable free approach.
+    _REDDIT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36")
     for sub in subreddits:
         print(f"[reddit] r/{sub}...")
-        raw = http_get(f"https://www.reddit.com/r/{sub}/new.json?limit=50", timeout=20)
+        try:
+            req = urllib.request.Request(
+                f"https://www.reddit.com/r/{sub}/new.json?limit=50&raw_json=1",
+                headers={"User-Agent": _REDDIT_UA,
+                         "Accept": "application/json",
+                         "Accept-Language": "en-US,en;q=0.9"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = json.loads(resp.read().decode())
+        except Exception as e:
+            print(f"  [reddit ✗] r/{sub} → {e}")
+            continue
         if not isinstance(raw, dict):
             continue
         for p in raw.get("data",{}).get("children",[]):
@@ -1072,7 +1149,7 @@ def collect_reddit_posts(rules: dict) -> list[dict]:
                 "location":    "",
                 "posted_at":   date_s,
             })
-        time.sleep(1)
+        time.sleep(2)  # be polite to Reddit
     print(f"  → {len(out)} Reddit posts total")
     return out
 
