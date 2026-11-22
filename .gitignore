@@ -13,7 +13,6 @@ logs/
 # macOS
 .DS_Store
 
-# Keep jobs.db tracked (GitHub Actions commits updated DB back here)
-# jobs.db   ← intentionally NOT ignored
+# The database lives on the `data` branch (published by the workflow), never on main
 jobs.db
 jobs.db-*

@@ -160,7 +160,11 @@ POSTER_ROLE_KEYWORDS = [
 
 def load_rules() -> dict:
     with open(RULES_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        rules = json.load(f)
+    extra = [c.strip() for c in os.environ.get("EXCLUDE_COMPANIES", "").split(",") if c.strip()]   # keeps private choices out of a public repo
+    if extra:
+        rules["excluded_companies"] = sorted(set(rules.get("excluded_companies", [])) | set(extra))
+    return rules
 
 
 def get_db() -> sqlite3.Connection:
@@ -3563,6 +3567,35 @@ _STATIC_SHIM = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{di
 })();
 </script>
 """
+_STATIC_SHIM_OPEN = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{display:none!important}
+#jhLock{position:fixed;inset:0;background:#0b0f19;z-index:99999;display:flex;align-items:center;justify-content:center;font-family:system-ui}
+#jhLock form{background:#111827;border:1px solid #374151;border-radius:14px;padding:28px;width:min(360px,90vw);text-align:center;color:#e5e7eb}
+#jhLock input{width:100%;padding:11px;margin:14px 0 8px;border-radius:8px;border:1px solid #4b5563;background:#0b0f19;color:#fff;box-sizing:border-box}
+#jhLock button{width:100%;padding:11px;border:0;border-radius:8px;background:#6d28d9;color:#fff;font-weight:600;cursor:pointer}
+#jhLock .err{color:#f87171;font-size:13px;min-height:18px}</style>
+<button>Unlock</button></form></div>
+<script>
+(function(){
+  const LS=localStorage, origFetch=window.fetch.bind(window); let DATA=null;
+  const ready=origFetch('data.json?'+Date.now()).then(r=>r.json()).then(d=>{DATA=d;});
+  const marks=()=>JSON.parse(LS.getItem('jh_marks')||'{}');
+  const json=o=>new Response(JSON.stringify(o),{headers:{'Content-Type':'application/json'}});
+  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes every few hours'):'';
+  window.fetch=async function(url,opts){
+    const u=String(url);
+    if(!u.startsWith('/api/')) return origFetch(url,opts);
+    await ready; const m=marks();
+    if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
+    if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
+    if(u==='/api/status'){ const b=JSON.parse(opts.body); const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
+      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); } return json({ok:true}); }
+    if(u==='/api/stats') return json({total_jobs:DATA.jobs.length,last_scan:{finished_at:DATA.meta.generated_at},scan:{running:false}});
+    if(u==='/api/scan-status') return json({running:false,stage:''});
+    return json({ok:true,started:false});
+  };
+})();
+</script>
+"""
 
 
 def _encrypt_payload(obj: object, password: str) -> dict:
@@ -3577,10 +3610,7 @@ def _encrypt_payload(obj: object, password: str) -> dict:
 
 def export_static(outdir: str) -> bool:
     """Write index.html + data.enc.json (+ vercel.json / robots.txt) to `outdir`."""
-    password = os.environ.get("DASH_PASSWORD", "")
-    if not password:
-        print("[export] DASH_PASSWORD is not set — refusing to publish an unprotected copy of your jobs")
-        return False
+    password = os.environ.get("DASH_PASSWORD", "")      # empty → open (unencrypted) dashboard
     conn = get_db()
     jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")]
     posts = [dict(r) for r in conn.execute("SELECT * FROM posts ORDER BY id DESC")]
@@ -3589,13 +3619,17 @@ def export_static(outdir: str) -> bool:
     meta = {"generated_at": now_utc(), "last_scan": (last["finished_at"] if last else ""), "jobs": len(jobs), "posts": len(posts)}
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
-    html = DASHBOARD_HTML.replace("<script>\n", _STATIC_SHIM + "<script>\n", 1)
+    payload = {"jobs": jobs, "posts": posts, "meta": meta}
+    html = DASHBOARD_HTML.replace("<script>\n", (_STATIC_SHIM if password else _STATIC_SHIM_OPEN) + "<script>\n", 1)
     (out / "index.html").write_text(html, encoding="utf-8")
-    (out / "data.enc.json").write_text(json.dumps(_encrypt_payload({"jobs": jobs, "posts": posts, "meta": meta}, password)), encoding="utf-8")
+    if password:
+        (out / "data.enc.json").write_text(json.dumps(_encrypt_payload(payload, password)), encoding="utf-8")
+    else:
+        (out / "data.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     (out / "robots.txt").write_text("User-agent: *\nDisallow: /\n", encoding="utf-8")
     (out / "vercel.json").write_text(json.dumps({"headers": [{"source": "/(.*)", "headers": [
         {"key": "X-Robots-Tag", "value": "noindex, nofollow"}, {"key": "Cache-Control", "value": "no-cache"}]}]}), encoding="utf-8")
-    print(f"[export] {len(jobs)} jobs + {len(posts)} posts encrypted → {out}")
+    print(f"[export] {len(jobs)} jobs + {len(posts)} posts ({'encrypted' if password else 'open'}) → {out}")
     return True
 
 
@@ -3847,10 +3881,12 @@ def sync_from_cloud() -> dict:
     import subprocess
     import tempfile
     try:
-        r = subprocess.run(["git", "fetch", "--quiet", "origin", "data"], cwd=str(BASE_DIR), capture_output=True, text=True, timeout=90)
+        remotes = subprocess.run(["git", "remote"], cwd=str(BASE_DIR), capture_output=True, text=True).stdout.split()
+        remote = os.environ.get("SYNC_REMOTE") or ("live" if "live" in remotes else "origin")
+        r = subprocess.run(["git", "fetch", "--quiet", remote, "data"], cwd=str(BASE_DIR), capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
             return {"ok": False, "error": (r.stderr or "git fetch failed").strip()[:200]}
-        blob = subprocess.run(["git", "show", "origin/data:jobs.db"], cwd=str(BASE_DIR), capture_output=True, timeout=60)
+        blob = subprocess.run(["git", "show", f"{remote}/data:jobs.db"], cwd=str(BASE_DIR), capture_output=True, timeout=60)
         if blob.returncode != 0 or len(blob.stdout) < 1000:
             return {"ok": False, "error": "no cloud database on the data branch yet"}
     except Exception as exc:

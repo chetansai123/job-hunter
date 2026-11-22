@@ -1,14 +1,15 @@
 name: 24/7 Job & Post Discovery
 
 # Free GitHub-hosted runner does the scanning while your Mac is off.
-#   light scan  every 4 hours  → job APIs only (Greenhouse, Lever, Ashby, Workday, remote boards, HuntYourTribe…)  ~5 min
-#   full scan   twice a day    → + LinkedIn jobs, company career pages (Playwright browser), HN/Reddit posts, Apify  ~15 min
+#   light scan  every 30 minutes → job APIs (Greenhouse, Lever, Ashby, Workday, remote boards …) + HN/Reddit posts   ~3 min
+#   full scan   every 3 hours    → + LinkedIn jobs, company career pages (Playwright browser), LinkedIn post search  ~15 min
+# GitHub may start scheduled runs a few minutes late when it is busy.
 # Results go to the `data` branch (one commit, history discarded) so the repo never bloats; the dashboard's
 # "Sync Cloud" button / auto-sync merges them into your local database without touching Applied/Saved marks.
 on:
   schedule:
-    - cron: '17 0,4,8,12,16,20 * * *'   # light — 05:47, 09:47, 13:47, 17:47, 21:47, 01:47 IST
-    - cron: '47 5,17 * * *'             # full  — 11:17 and 23:17 IST
+    - cron: '*/30 * * * *'      # light scan every 30 minutes (job APIs, Workday, remote boards, HN/Reddit posts)  ~3 min
+    - cron: '17 */3 * * *'      # full scan every 3 hours (+ LinkedIn jobs, career pages in a real browser, LinkedIn post search)  ~15 min
   workflow_dispatch:
     inputs:
       mode:
@@ -19,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: discovery
@@ -29,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '47 5,17 * * *' && 'full' || 'light') }}
+      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '17 */3 * * *' && 'full' || 'light') }}
       SCAN_INTERVAL_MINUTES: '0'
       AUTO_SYNC: '0'
       APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -38,6 +40,7 @@ jobs:
       SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       DASH_PASSWORD: ${{ secrets.DASH_PASSWORD }}
+      EXCLUDE_COMPANIES: ${{ secrets.EXCLUDE_COMPANIES }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,9 +82,9 @@ jobs:
           echo "published $(du -h jobs.db | cut -f1)"
 
       - name: Build the encrypted dashboard and publish it to the site branch (Vercel serves this branch)
-        if: always() && env.DASH_PASSWORD != ''
+        if: always()
         run: |
-          pip install --quiet cryptography
+          [ -n "$DASH_PASSWORD" ] && pip install --quiet cryptography
           python job_hunter.py --export-static /tmp/site
           cd /tmp/site
           git init -q -b site
@@ -91,3 +94,9 @@ jobs:
           git commit -q -m "dashboard $(date -u +%FT%TZ)"
           git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" site
           echo "site branch published"
+
+      - name: Keep the schedule alive (GitHub pauses scheduled workflows after 60 days of no repo activity)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/discovery.yml/enable" || true
