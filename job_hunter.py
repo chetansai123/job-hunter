@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import ssl
 import threading
 import unicodedata
@@ -2390,8 +2391,128 @@ def _li_item_to_post(it: dict, rules: dict) -> dict | None:
             "location": "", "posted_at": date, "_headline": headline}
 
 
+# ── LinkedIn posts via FREE search APIs (no Apify): find post URLs → read the PUBLIC post page (no login) ──
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")     # serper.dev — 2,500 free searches, no card
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")     # tavily.com — 1,000 free searches / month, no card
+LI_SEARCH_PHRASES = [
+    '"we are hiring" "react developer"', '"hiring" "full stack developer" "node.js"', '"hiring" "typescript" "react" engineer',
+    '"hiring" "next.js developer"', '"hiring" "MERN stack"', '"hiring" "software engineer" "2-4 years" india', '"hiring" "frontend developer" "react" india',
+    '"founding engineer" hiring react node', '"send your resume" "react" developer', '"DM me" hiring "full stack"', '"open position" "node.js developer" india',
+    '"hiring" "javascript developer" bangalore OR hyderabad OR pune OR remote',
+]
+
+
+def _search_post_urls(query: str) -> list[str]:
+    out: list[str] = []
+    try:
+        if SERPER_API_KEY:
+            req = urllib.request.Request("https://google.serper.dev/search", method="POST",
+                                         data=json.dumps({"q": f"site:linkedin.com/posts {query}", "num": 20, "tbs": "qdr:m"}).encode(),
+                                         headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = [x.get("link", "") for x in json.loads(r.read().decode()).get("organic", [])]
+        elif TAVILY_API_KEY:
+            req = urllib.request.Request("https://api.tavily.com/search", method="POST",
+                                         data=json.dumps({"query": query.replace('"', ""), "include_domains": ["linkedin.com"], "max_results": 20,
+                                                          "time_range": "month", "search_depth": "basic"}).encode(),
+                                         headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                out = [x.get("url", "") for x in json.loads(r.read().decode()).get("results", [])]
+        else:                                           # keyless best effort — usually bot-blocked, harmless when it is
+            h = http_get_text("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(f"site:linkedin.com/posts {query}"), 25, quiet=True)
+            out = [urllib.parse.unquote(m) for m in re.findall(r"uddg=([^&\"]+)", h or "")]
+    except Exception as exc:
+        print(f"  [search ✗] {str(exc)[:80]}")
+    return [u.split("?")[0] for u in out if "linkedin.com/posts/" in u or "linkedin.com/feed/update/" in u]
+
+
+_PROFILE_HEAD: dict[str, str] = {}
+
+
+def _li_headline(profile_url: str) -> str | None:
+    """'Name - Founder @ X - Y | LinkedIn' from the public profile page → 'Founder @ X - Y' (None when unreadable)."""
+    if not profile_url:
+        return None
+    if profile_url in _PROFILE_HEAD:
+        return _PROFILE_HEAD[profile_url]
+    time.sleep(1.0)
+    h = http_get_text(profile_url, 20, quiet=True)
+    m = re.search(r'<meta property="og:title" content="([^"]+)"', h or "")
+    head = None
+    if m:
+        t = htmllib.unescape(m.group(1)).replace(" | LinkedIn", "")
+        head = t.split(" - ", 1)[1] if " - " in t else ""
+    _PROFILE_HEAD[profile_url] = head
+    return head
+
+
+def _li_public_post(url: str, rules: dict) -> dict | None:
+    time.sleep(1.2)
+    h = http_get_text(url, 25, quiet=True)
+    if not h:
+        return None
+    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', h, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("@type") in ("SocialMediaPosting", "DiscussionForumPosting", "Article"):
+            body = unicodedata.normalize("NFKC", d.get("articleBody") or d.get("text") or "").strip()
+            a = d.get("author") or {}
+            if not body or not isinstance(a, dict):
+                return None
+            date = (d.get("datePublished") or "")[:10]
+            if date and (days_ago(date) or 0) > rules.get("freshness", {}).get("max_age_days", 40):
+                return None
+            purl = (a.get("url") or "").split("?")[0]
+            head = _li_headline(purl)
+            return {"source": "LinkedIn", "poster_name": unicodedata.normalize("NFKC", a.get("name", "")), "poster_role": head or "",
+                    "poster_url": purl or url, "post_url": url, "post_text": body[:1800], "skills_found": _extract_skills(body, rules),
+                    "location": "", "posted_at": date, "_headline": head}
+    return None
+
+
+def collect_linkedin_search(rules: dict) -> list[dict]:
+    """Free route to LinkedIn hiring posts: Serper / Tavily (free tiers) find URLs, the public page gives the full text."""
+    if not (SERPER_API_KEY or TAVILY_API_KEY) and os.environ.get("DDG_FALLBACK", "1") != "1":
+        return []
+    day = datetime.now().toordinal()
+    n = int(os.environ.get("LI_SEARCH_QUERIES", "6"))
+    phrases = [LI_SEARCH_PHRASES[(day * n + i) % len(LI_SEARCH_PHRASES)] for i in range(n)]      # rotate through the list daily
+    conn = get_db()
+    known = {r[0] for r in conn.execute("SELECT post_url FROM posts")}
+    conn.close()
+    urls: list[str] = []
+    for q in phrases:
+        for u in _search_post_urls(q):
+            if u not in known and u not in urls:
+                urls.append(u)
+        time.sleep(0.5)
+    print(f"[linkedin-search] {len(phrases)} searches → {len(urls)} new post URLs "
+          f"({'Serper' if SERPER_API_KEY else 'Tavily' if TAVILY_API_KEY else 'keyless'})")
+    out = []
+    for u in urls[: int(os.environ.get("LI_SEARCH_FETCH", "40"))]:
+        p = _li_public_post(u, rules)
+        if p:
+            out.append(p)
+    print(f"  → {len(out)} readable posts")
+    return out
+
+
+def _apify_budget_ok(min_usd: float = 0.8) -> bool:
+    """Never burn the free monthly credit: skip the paid pull when less than `min_usd` is left."""
+    try:
+        d = http_get(f"https://api.apify.com/v2/users/me/limits?token={APIFY_TOKEN}", timeout=20, quiet=True)
+        data = d.get("data", {}) if isinstance(d, dict) else {}
+        left = float(data["limits"]["maxMonthlyUsageUsd"]) - float(data["current"]["monthlyUsageUsd"])
+        print(f"[apify] ${left:.2f} of the monthly credit left")
+        return left >= min_usd
+    except Exception:
+        return False
+
+
 def collect_linkedin_apify(rules: dict) -> list[dict]:
-    if not APIFY_TOKEN or not _due("apify_li_posts", APIFY_POST_HOURS):
+    if not APIFY_TOKEN or not _due("apify_li_posts", APIFY_POST_HOURS) or not _apify_budget_ok():
         return []
     # each query is run per author group; spend is capped per run (see apify_run)
     per_q = max(10, int(LI_MAX_POSTS * 0.6))
@@ -3389,6 +3510,95 @@ def revet_existing_posts(rules: dict) -> int:
     return gone
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STATIC, PASSWORD-ENCRYPTED DASHBOARD  (deploy the output folder to Vercel / Cloudflare Pages / any static host)
+#  index.html is public but contains no data; data.enc.json is AES-GCM encrypted with DASH_PASSWORD and is decrypted
+#  in the browser. Applied / Saved marks are kept in the browser's localStorage.
+# ═══════════════════════════════════════════════════════════════════════════
+_STATIC_SHIM = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{display:none!important}
+#jhLock{position:fixed;inset:0;background:#0b0f19;z-index:99999;display:flex;align-items:center;justify-content:center;font-family:system-ui}
+#jhLock form{background:#111827;border:1px solid #374151;border-radius:14px;padding:28px;width:min(360px,90vw);text-align:center;color:#e5e7eb}
+#jhLock input{width:100%;padding:11px;margin:14px 0 8px;border-radius:8px;border:1px solid #4b5563;background:#0b0f19;color:#fff;box-sizing:border-box}
+#jhLock button{width:100%;padding:11px;border:0;border-radius:8px;background:#6d28d9;color:#fff;font-weight:600;cursor:pointer}
+#jhLock .err{color:#f87171;font-size:13px;min-height:18px}</style>
+<div id="jhLock"><form id="jhForm"><div style="font-size:30px">🎯</div><h3 style="margin:6px 0 0">Job Hunter</h3>
+<input id="jhPw" type="password" placeholder="Password" autocomplete="current-password" autofocus><div class="err" id="jhErr"></div>
+<button>Unlock</button></form></div>
+<script>
+(function(){
+  const LS=localStorage, origFetch=window.fetch.bind(window); let DATA=null;
+  const b64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+  async function decrypt(pw){
+    const enc=await (await origFetch('data.enc.json?'+Date.now())).json();
+    const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+    const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64(enc.salt),iterations:enc.iter,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['decrypt']);
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64(enc.iv)},key,b64(enc.ct));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+  const ready=new Promise(resolve=>{
+    const lock=document.getElementById('jhLock'), form=document.getElementById('jhForm'), err=document.getElementById('jhErr');
+    async function attempt(pw){
+      try{ DATA=await decrypt(pw); LS.setItem('jh_pw',pw); lock.style.display='none'; resolve(); return true; }
+      catch(e){ LS.removeItem('jh_pw'); err.textContent='Wrong password (or data not published yet)'; return false; }
+    }
+    form.addEventListener('submit',ev=>{ ev.preventDefault(); attempt(document.getElementById('jhPw').value); });
+    const saved=LS.getItem('jh_pw'); if(saved) attempt(saved);
+  });
+  const marks=()=>JSON.parse(LS.getItem('jh_marks')||'{}');
+  const json=o=>new Response(JSON.stringify(o),{headers:{'Content-Type':'application/json'}});
+  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes every few hours'):'';
+  window.fetch=async function(url,opts){
+    const u=String(url);
+    if(!u.startsWith('/api/')) return origFetch(url,opts);
+    await ready; const m=marks();
+    if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
+    if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
+    if(u==='/api/status'){ const b=JSON.parse(opts.body); const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
+      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); } return json({ok:true}); }
+    if(u==='/api/stats') return json({total_jobs:DATA.jobs.length,last_scan:{finished_at:DATA.meta.generated_at},scan:{running:false}});
+    if(u==='/api/scan-status') return json({running:false,stage:''});
+    return json({ok:true,started:false});
+  };
+})();
+</script>
+"""
+
+
+def _encrypt_payload(obj: object, password: str) -> dict:
+    import base64
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    salt, iv, iters = os.urandom(16), os.urandom(12), 250_000
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, 32)
+    ct = AESGCM(key).encrypt(iv, json.dumps(obj, ensure_ascii=False).encode("utf-8"), None)
+    b = lambda x: base64.b64encode(x).decode()
+    return {"v": 1, "iter": iters, "salt": b(salt), "iv": b(iv), "ct": b(ct)}
+
+
+def export_static(outdir: str) -> bool:
+    """Write index.html + data.enc.json (+ vercel.json / robots.txt) to `outdir`."""
+    password = os.environ.get("DASH_PASSWORD", "")
+    if not password:
+        print("[export] DASH_PASSWORD is not set — refusing to publish an unprotected copy of your jobs")
+        return False
+    conn = get_db()
+    jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")]
+    posts = [dict(r) for r in conn.execute("SELECT * FROM posts ORDER BY id DESC")]
+    last = conn.execute("SELECT finished_at FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    meta = {"generated_at": now_utc(), "last_scan": (last["finished_at"] if last else ""), "jobs": len(jobs), "posts": len(posts)}
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    html = DASHBOARD_HTML.replace("<script>\n", _STATIC_SHIM + "<script>\n", 1)
+    (out / "index.html").write_text(html, encoding="utf-8")
+    (out / "data.enc.json").write_text(json.dumps(_encrypt_payload({"jobs": jobs, "posts": posts, "meta": meta}, password)), encoding="utf-8")
+    (out / "robots.txt").write_text("User-agent: *\nDisallow: /\n", encoding="utf-8")
+    (out / "vercel.json").write_text(json.dumps({"headers": [{"source": "/(.*)", "headers": [
+        {"key": "X-Robots-Tag", "value": "noindex, nofollow"}, {"key": "Cache-Control", "value": "no-cache"}]}]}), encoding="utf-8")
+    print(f"[export] {len(jobs)} jobs + {len(posts)} posts encrypted → {out}")
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  MAIN SCAN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3591,7 +3801,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _stage("collecting hiring posts")
     post_fns = (collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
     if SCAN_MODE == "full":
-        post_fns += (collect_linkedin_apify,)
+        post_fns += (collect_linkedin_search, collect_linkedin_apify)
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
 
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
@@ -3873,7 +4083,7 @@ a.apply-btn.board{background:#92400e;}
 <header>
   <div>
     <h1>🎯 Job Hunter</h1>
-    <div class="sub" id="lastScan">Auto-discovery every 30 min · direct company links preferred, board links flagged</div>
+    <div class="sub" id="lastScan">GitHub scans in the cloud: light every 4 h, full twice a day · only direct company links or apply-by-email are shown</div>
   </div>
   <div class="hbtns">
     <button class="sec" onclick="toggleScan()">+ Manual Scan</button>
@@ -4022,7 +4232,7 @@ async function syncCloud(){
 async function refresh(){
   await Promise.all([loadJobs(), loadPosts()]);
   document.getElementById('lastScan').textContent =
-    'Last refreshed: '+new Date().toLocaleTimeString()+' · Auto every 30 min';
+    'Last refreshed: '+new Date().toLocaleTimeString()+' · '+(window.__jhNote ? window.__jhNote() : 'auto-syncs with the cloud every 10 min');
 }
 
 async function loadJobs(){
@@ -4368,6 +4578,7 @@ def main() -> None:
     parser.add_argument("--scan",       action="store_true", help="Run one-off scan and exit")
     parser.add_argument("--mode",       choices=["light", "full"], help="With --scan: light = job APIs only, full = everything")
     parser.add_argument("--serve",      action="store_true", help="Start dashboard + discovery loop")
+    parser.add_argument("--export-static", metavar="DIR", help="Write the encrypted static dashboard (for Vercel) to DIR and exit")
     parser.add_argument("--posts",      action="store_true", help="Pull + vet hiring posts only (LinkedIn via Apify) and exit")
     parser.add_argument("--port",       type=int, default=SERVE_PORT)
     parser.add_argument("--host",       default=SERVE_HOST,
@@ -4375,6 +4586,9 @@ def main() -> None:
     args = parser.parse_args()
 
     init_db()
+
+    if args.export_static:
+        sys.exit(0 if export_static(args.export_static) else 1)
 
     if args.posts:
         conn = get_db()
