@@ -15,3 +15,5 @@ logs/
 
 # Keep jobs.db tracked (GitHub Actions commits updated DB back here)
 # jobs.db   ← intentionally NOT ignored
+jobs.db
+jobs.db-*

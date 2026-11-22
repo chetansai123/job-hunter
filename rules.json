@@ -766,5 +766,242 @@
     "allow_board_links": false,
     "allow_email_apply": true,
     "_note": "Only direct company/ATS apply links, or an apply-by-email address. Third-party board links are dropped."
-  }
+  },
+  "workday_boards": [
+    {
+      "host": "salesforce.wd12.myworkdayjobs.com",
+      "tenant": "salesforce",
+      "site": "External_Career_Site"
+    },
+    {
+      "host": "nvidia.wd5.myworkdayjobs.com",
+      "tenant": "nvidia",
+      "site": "NVIDIAExternalCareerSite"
+    },
+    {
+      "host": "paypal.wd1.myworkdayjobs.com",
+      "tenant": "paypal",
+      "site": "jobs"
+    },
+    {
+      "host": "capitalone.wd12.myworkdayjobs.com",
+      "tenant": "capitalone",
+      "site": "Capital_One"
+    },
+    {
+      "host": "intel.wd1.myworkdayjobs.com",
+      "tenant": "intel",
+      "site": "External"
+    },
+    {
+      "host": "blackrock.wd1.myworkdayjobs.com",
+      "tenant": "blackrock",
+      "site": "BlackRock_Professional"
+    },
+    {
+      "host": "gartner.wd5.myworkdayjobs.com",
+      "tenant": "gartner",
+      "site": "EXT"
+    },
+    {
+      "host": "pwc.wd3.myworkdayjobs.com",
+      "tenant": "pwc",
+      "site": "Global_Experienced_Careers"
+    },
+    {
+      "host": "fiserv.wd5.myworkdayjobs.com",
+      "tenant": "fiserv",
+      "site": "EXT"
+    },
+    {
+      "host": "nasdaq.wd1.myworkdayjobs.com",
+      "tenant": "nasdaq",
+      "site": "Global_External_Site"
+    },
+    {
+      "host": "analogdevices.wd1.myworkdayjobs.com",
+      "tenant": "analogdevices",
+      "site": "External"
+    },
+    {
+      "host": "philips.wd3.myworkdayjobs.com",
+      "tenant": "philips",
+      "site": "jobs-and-careers"
+    },
+    {
+      "host": "postman.wd108.myworkdayjobs.com",
+      "tenant": "postman",
+      "site": "careers"
+    },
+    {
+      "host": "jiostar.wd102.myworkdayjobs.com",
+      "tenant": "jiostar",
+      "site": "JioStar"
+    },
+    {
+      "host": "3m.wd1.myworkdayjobs.com",
+      "tenant": "3m",
+      "site": "Search"
+    },
+    {
+      "host": "medtronic.wd1.myworkdayjobs.com",
+      "tenant": "medtronic",
+      "site": "MedtronicCareers"
+    },
+    {
+      "host": "iqvia.wd1.myworkdayjobs.com",
+      "tenant": "iqvia",
+      "site": "IQVIA"
+    },
+    {
+      "host": "thermofisher.wd5.myworkdayjobs.com",
+      "tenant": "thermofisher",
+      "site": "ThermoFisherCareers"
+    },
+    {
+      "host": "target.wd5.myworkdayjobs.com",
+      "tenant": "target",
+      "site": "targetcareers"
+    },
+    {
+      "host": "lowes.wd5.myworkdayjobs.com",
+      "tenant": "lowes",
+      "site": "LWS_External_CS"
+    },
+    {
+      "host": "aptiv.wd5.myworkdayjobs.com",
+      "tenant": "aptiv",
+      "site": "APTIV_CAREERS"
+    },
+    {
+      "host": "abbott.wd5.myworkdayjobs.com",
+      "tenant": "abbott",
+      "site": "abbottcareers"
+    },
+    {
+      "host": "adobe.wd5.myworkdayjobs.com",
+      "tenant": "adobe",
+      "site": "external_experienced"
+    },
+    {
+      "host": "americanexpress.wd5.myworkdayjobs.com",
+      "tenant": "americanexpress",
+      "site": "Amex"
+    },
+    {
+      "host": "autodesk.wd1.myworkdayjobs.com",
+      "tenant": "autodesk",
+      "site": "Ext"
+    },
+    {
+      "host": "broadcom.wd1.myworkdayjobs.com",
+      "tenant": "broadcom",
+      "site": "External_Career"
+    },
+    {
+      "host": "cisco.wd5.myworkdayjobs.com",
+      "tenant": "cisco",
+      "site": "Cisco_Careers"
+    },
+    {
+      "host": "citi.wd5.myworkdayjobs.com",
+      "tenant": "citi",
+      "site": "2"
+    },
+    {
+      "host": "commvault.wd1.myworkdayjobs.com",
+      "tenant": "commvault",
+      "site": "Commvault"
+    },
+    {
+      "host": "dell.wd1.myworkdayjobs.com",
+      "tenant": "dell",
+      "site": "External"
+    },
+    {
+      "host": "ebay.wd5.myworkdayjobs.com",
+      "tenant": "ebay",
+      "site": "Ebay"
+    },
+    {
+      "host": "expedia.wd5.myworkdayjobs.com",
+      "tenant": "expedia",
+      "site": "search"
+    },
+    {
+      "host": "hp.wd5.myworkdayjobs.com",
+      "tenant": "hp",
+      "site": "ExternalCareerSite"
+    },
+    {
+      "host": "informatica.wd1.myworkdayjobs.com",
+      "tenant": "informatica",
+      "site": "Informatica"
+    },
+    {
+      "host": "litera.wd12.myworkdayjobs.com",
+      "tenant": "litera",
+      "site": "Litera_Careers"
+    },
+    {
+      "host": "lnw.wd5.myworkdayjobs.com",
+      "tenant": "lnw",
+      "site": "sciplayexternalcareerssite"
+    },
+    {
+      "host": "micron.wd1.myworkdayjobs.com",
+      "tenant": "micron",
+      "site": "External"
+    },
+    {
+      "host": "nike.wd1.myworkdayjobs.com",
+      "tenant": "nike",
+      "site": "nke"
+    },
+    {
+      "host": "pure.wd1.myworkdayjobs.com",
+      "tenant": "pure",
+      "site": "Pure"
+    },
+    {
+      "host": "redhat.wd5.myworkdayjobs.com",
+      "tenant": "redhat",
+      "site": "Jobs"
+    },
+    {
+      "host": "sabre.wd1.myworkdayjobs.com",
+      "tenant": "sabre",
+      "site": "SabreJobs"
+    },
+    {
+      "host": "statestreet.wd1.myworkdayjobs.com",
+      "tenant": "statestreet",
+      "site": "Global"
+    },
+    {
+      "host": "veradigm.wd12.myworkdayjobs.com",
+      "tenant": "veradigm",
+      "site": "vr"
+    },
+    {
+      "host": "vmware.wd1.myworkdayjobs.com",
+      "tenant": "vmware",
+      "site": "VMware"
+    },
+    {
+      "host": "walmart.wd5.myworkdayjobs.com",
+      "tenant": "walmart",
+      "site": "WalmartExternal"
+    },
+    {
+      "host": "workday.wd5.myworkdayjobs.com",
+      "tenant": "workday",
+      "site": "Workday"
+    },
+    {
+      "host": "zebra.wd1.myworkdayjobs.com",
+      "tenant": "zebra",
+      "site": "Zebra"
+    }
+  ]
 }

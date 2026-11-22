@@ -231,6 +231,15 @@ def init_db() -> None:
             PRIMARY KEY (kind, token)
         );
 
+        CREATE TABLE IF NOT EXISTS workday_boards (
+            host     TEXT NOT NULL,
+            tenant   TEXT NOT NULL,
+            site     TEXT NOT NULL,
+            source   TEXT DEFAULT '',
+            failures INTEGER DEFAULT 0,
+            PRIMARY KEY (host, tenant, site)
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
             v TEXT
@@ -691,6 +700,8 @@ _NEGATIVE_TITLE = [
     "graduate engineer", "data security", "support", "implementation", "consultant", "architect",
     "in test", "sdet", "test automation", "ci engineer", "android", "ios", "flutter", "solidity", "developer advocate",
     "customer success", "support engineer", "sales engineer", "solutions engineer",
+    "power bi", "bi developer", "tableau", "etl", "data warehouse", "datawarehouse", "dwh", "qlik", "business intelligence",
+    "informatica", "snowflake developer", "mainframe", "cobol", "oracle apps", "peoplesoft",
 ]
 _SOFT_NEG = {"customer", "marketing", "growth", "content", "creative", "solutions", "implementation", "consultant", "support",
              "account", "quality", "infrastructure", "ecosystem", "technical services", "contractor", "freelance", "reviewer",
@@ -1177,6 +1188,7 @@ def _job(company, title, apply_url, source, rules, **extra) -> dict:
         "title_from_page": extra.get("title_from_page", False),
         "apply_hint": extra.get("apply_hint"),
         "board": extra.get("board", ""),
+        "jd_wd": extra.get("jd_wd"),
     }
 
 
@@ -1299,6 +1311,47 @@ def chrome_render(url: str, budget_ms: int = 9000) -> str:
             return ""
 
 
+try:                                   # optional: pip install playwright && playwright install chromium
+    from playwright.sync_api import sync_playwright as _sync_playwright
+except Exception:                      # not installed → the plain headless-Chrome subprocess is used instead
+    _sync_playwright = None
+_PW: dict = {"pw": None, "browser": None}
+_PW_EXEC = ThreadPoolExecutor(1)      # Playwright's sync API is bound to the thread that started it
+
+
+def _pw_task(url: str, wait_ms: int) -> str:
+    try:
+        if _PW["browser"] is None:
+            _PW["pw"] = _sync_playwright().start()
+            _PW["browser"] = _PW["pw"].chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = _PW["browser"].new_context(user_agent=BROWSER_UA, locale="en-IN", viewport={"width": 1366, "height": 900})
+        page = ctx.new_page()
+        page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=wait_ms)
+        except Exception:
+            pass
+        html = page.content()
+        ctx.close()
+        return html
+    except Exception:
+        return ""
+
+
+def render_page(url: str, budget_ms: int = 9000) -> str:
+    """Rendered HTML of a JavaScript page: Playwright when installed (waits for the network to settle, blocks images),
+    otherwise the machine's headless Chrome."""
+    if _sync_playwright is not None:
+        try:
+            html = _PW_EXEC.submit(_pw_task, url, budget_ms).result(timeout=70)
+            if html:
+                return html
+        except Exception:
+            pass
+    return chrome_render(url, budget_ms)
+
+
 def _fetch_page(url: str) -> tuple[str, list[str]]:
     """Firecrawl-local render (JS pages) with plain-HTTP fallback → (markdown/text, links)."""
     sc = fc_scrape(url)
@@ -1310,7 +1363,7 @@ def _fetch_page(url: str) -> tuple[str, list[str]]:
         if len(txt) > len(md):
             md = txt
     if len(md) < 400:                                   # JS-rendered page (Ashby, Workday, SPA…) → real browser
-        dom = chrome_render(url)
+        dom = render_page(url)
         txt = _html_to_text(dom) if dom else ""
         if len(txt) > len(md) and not any(c in txt.lower()[:300] for c in _CHALLENGE):
             md = txt
@@ -1671,7 +1724,7 @@ def collect_company_careers(rules: dict) -> list[dict]:
         md = sc.get("markdown") or ""
         links = [l for l in (sc.get("links") or []) if isinstance(l, str)]
         if len(md) < 300 and len(links) < 5:                 # JS-rendered careers page → real headless browser
-            dom = chrome_render(url, 10000)
+            dom = render_page(url, 10000)
             if dom and not any(c in dom.lower()[:1500] for c in _CHALLENGE):
                 anchors = [(re.sub(r"<[^>]+>|\s+", " ", a).strip(), urllib.parse.urljoin(url, h))
                            for h, a in re.findall(r'<a\b[^>]*?href="([^"#][^"]*)"[^>]*>(.*?)</a>', dom, re.S | re.I)]
@@ -2579,6 +2632,106 @@ def collect_ats_boards(rules: dict) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  WORKDAY  (huge companies; the public CXS JSON API returns the full JD without a browser)
+# ═══════════════════════════════════════════════════════════════════════════
+_WD_URL = re.compile(r"https?://([a-z0-9\-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/?#]+)", re.I)
+_WD_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+_WD_QUERIES = ["software engineer", "developer", "react", "node", "javascript", "full stack"]
+_WD_NAMES = {"jiostar": "JioStar", "capitalone": "Capital One", "americanexpress": "American Express", "thomsonreuters": "Thomson Reuters",
+             "redhat": "Red Hat", "paypal": "PayPal", "hp": "HP", "ge": "GE", "netapp": "NetApp", "blackrock": "BlackRock"}
+
+
+_HOST_LAST: dict[str, float] = {}
+_HOST_LOCK = threading.Lock()
+
+
+def _host_gap(host: str, gap: float) -> None:
+    """Block until at least `gap` seconds passed since the last request to this host (shared by all threads)."""
+    while True:
+        with _HOST_LOCK:
+            now = time.time()
+            wait = _HOST_LAST.get(host, 0) + gap - now
+            if wait <= 0:
+                _HOST_LAST[host] = now
+                return
+        time.sleep(min(wait, gap))
+
+
+def workday_board_from_url(url: str) -> tuple[str, str, str] | None:
+    m = _WD_URL.match(url or "")
+    if not m or m.group(3).lower() in ("wday", "en-us"):
+        return None
+    return f"{m.group(1)}.{m.group(2)}.myworkdayjobs.com".lower(), m.group(1).lower(), m.group(3)
+
+
+def register_workday(conn: sqlite3.Connection, url: str, source: str = "") -> None:
+    b = workday_board_from_url(url)
+    if b:
+        conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)", (*b, source))
+        conn.commit()
+
+
+def _fetch_workday(board: tuple[str, str, str], rules: dict) -> list[dict]:
+    host, tenant, site = board
+    company = _WD_NAMES.get(tenant, tenant.replace("-", " ").title())
+    out: dict[str, dict] = {}
+    deadline = time.time() + 75                                   # never let one slow / rate-limited tenant stall the scan
+    throttled = 0
+    for q in _WD_QUERIES:
+        for offset in (0, 20):
+            if time.time() > deadline or throttled >= 2:
+                break
+            d = http_post(f"https://{host}/wday/cxs/{tenant}/{site}/jobs",
+                          {"appliedFacets": {}, "limit": 20, "offset": offset, "searchText": q},
+                          timeout=20, extra_headers=_WD_HEADERS)
+            if not isinstance(d, dict) or d.get("jobPostings") is None:
+                throttled += 1                                    # 429 / blocked: back off, try the next query once
+                time.sleep(3)
+                break
+            posts = d["jobPostings"]
+            for j in posts:
+                path, title, loc = j.get("externalPath", ""), j.get("title", ""), j.get("locationsText", "")
+                if not path or path in out:
+                    continue
+                multi = bool(re.match(r"\d+\s+locations", loc or "", re.I))
+                if not _prefilter(title, company, f"https://{host}/{site}{path}", "" if multi else loc, rules):
+                    continue
+                out[path] = _job(company, title, f"https://{host}/{site}{path}", "ats:workday", rules, location="" if multi else loc,
+                                 jd_wd=f"https://{host}/wday/cxs/{tenant}/{site}{path}", reason=f"Workday · {tenant}")
+            if len(posts) < 20:
+                break
+            time.sleep(0.3)
+    _wd_failed(board, throttled >= 2 and not out)
+    return list(out.values())
+
+
+def _wd_failed(board: tuple[str, str, str], failed: bool) -> None:
+    conn = get_db()
+    try:
+        conn.execute("UPDATE workday_boards SET failures=? WHERE host=? AND tenant=? AND site=?",
+                     ((conn.execute("SELECT failures FROM workday_boards WHERE host=? AND tenant=? AND site=?", board).fetchone() or [0])[0] + 1 if failed else 0, *board))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def collect_workday(rules: dict) -> list[dict]:
+    conn = get_db()
+    for b in rules.get("workday_boards", []):
+        conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)",
+                     (b["host"], b["tenant"], b["site"], "seed"))
+    conn.commit()
+    boards = [(r["host"], r["tenant"], r["site"]) for r in conn.execute("SELECT host, tenant, site FROM workday_boards WHERE failures < 4")]
+    conn.close()
+    print(f"[workday] polling {len(boards)} Workday career sites ...")
+    with ThreadPoolExecutor(5) as ex:
+        results = list(ex.map(lambda b: _fetch_workday(b, rules), boards))
+    out = [j for r in results for j in r]
+    print(f"  → {len(out)} candidate roles")
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  DIRECT-LINK RESOLUTION  (company/ATS page for a role found on a job board)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2745,9 +2898,9 @@ def resolve_via_site(company: str, title: str, rules: dict | None = None) -> tup
                 h = http_get_text(base.rstrip("/") + pth, timeout=6, quiet=True)
                 if h and len(h) > 600:
                     pages.append((base.rstrip("/") + pth, h))
-            if _CHROME:                                   # careers pages are often JS-rendered → also try the real browser
+            if _CHROME or _sync_playwright:               # careers pages are often JS-rendered → also try the real browser
                 for pth in ("/careers", "/jobs"):
-                    dom = chrome_render(base.rstrip("/") + pth, 8000)
+                    dom = render_page(base.rstrip("/") + pth, 8000)
                     if dom and len(dom) > 1500 and not any(ch in dom.lower()[:1500] for ch in _CHALLENGE):
                         pages.append((base.rstrip("/") + pth, dom))
             for page_url, h in pages:
@@ -2806,6 +2959,27 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     # ── 1. full JD ─────────────────────────────────────────────────────────
     jd = job.get("jd_text") or ""
     md, links = "", []
+    if len(jd) < 300 and job.get("jd_wd"):
+        d = {}
+        for attempt in range(4):                                   # polite: one request per second per tenant, back off on 429
+            _host_gap(_netloc(job["jd_wd"]), 1.1)
+            d = http_get(job["jd_wd"], timeout=25, quiet=True)
+            if isinstance(d, dict) and d.get("jobPostingInfo"):
+                break
+            time.sleep(3 + attempt * 4)
+        info_wd = d.get("jobPostingInfo", {}) if isinstance(d, dict) else {}
+        if not info_wd:
+            return None, "full JD unreadable (Workday rate limit — retried next scan)"
+        if info_wd.get("jobDescription"):
+            jd = _html_to_text(htmllib.unescape(info_wd["jobDescription"]))
+            extra_loc = " ; ".join(x for x in [info_wd.get("location", "")] + list(info_wd.get("additionalLocations") or []) if x)
+            if extra_loc and not job.get("location"):
+                job["location"] = extra_loc[:140]
+            if info_wd.get("jobReqId"):
+                jd += f"\nJob ID: {info_wd['jobReqId']}"
+            if info_wd.get("externalUrl"):
+                job["direct_apply_url"] = info_wd["externalUrl"]
+                url = job["direct_apply_url"]
     if len(jd) < 300 and job.get("jd_api"):
         d = http_get(job["jd_api"], timeout=25)
         txt = d.get("content", "") if isinstance(d, dict) else ""
@@ -3222,6 +3396,7 @@ def revet_existing_posts(rules: dict) -> int:
 _SCAN_LOCK = threading.Lock()
 SCAN_STATE: dict = {"running": False, "stage": "", "started": None, "summary": None}
 MAX_VERIFY_PER_SCAN = int(os.environ.get("MAX_VERIFY_PER_SCAN", "400"))
+SCAN_MODE = os.environ.get("SCAN_MODE", "full").lower()      # "light" = job APIs only (fast); "full" = + LinkedIn, careers pages, Apify
 REJECT_RECHECK_DAYS = 3
 
 
@@ -3304,14 +3479,17 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         candidates = _collect_manual(custom_urls, rules)
     else:
         collectors = [
-            collect_company_careers,     # grows the ATS board list + finds roles on career pages
             collect_ats_boards,          # Greenhouse / Lever / Ashby (direct, full JD in API)
-            collect_huntyourtribe, collect_urbanodx, collect_jsguru, collect_matcha,
-            collect_hn_jobs, collect_linkedin_jobs,
-            collect_remoteok, collect_remotive, collect_working_nomads, collect_himalayas,
-            collect_jobicy, collect_arbeitnow, collect_weworkremotely,
-            collect_firecrawl_global, collect_career_pages,
+            collect_workday,             # Workday career sites (public JSON API, full JD)
+            collect_huntyourtribe, collect_urbanodx, collect_jsguru,
+            collect_remoteok, collect_remotive, collect_himalayas, collect_jobicy, collect_weworkremotely,
         ]
+        if SCAN_MODE == "full":
+            collectors += [
+                collect_company_careers,     # grows the ATS board list + finds roles on career pages (browser)
+                collect_matcha, collect_hn_jobs, collect_linkedin_jobs, collect_working_nomads, collect_arbeitnow,
+                collect_firecrawl_global, collect_career_pages,
+            ]
 
         def run_collector(fn):
             try:
@@ -3366,6 +3544,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     conn.commit()
     for j in accepted:
         register_board(conn, j["direct_apply_url"], j.get("discovery_source", ""))
+        register_workday(conn, j["direct_apply_url"], j.get("discovery_source", ""))
     accepted = collapse_same_day(accepted)
 
     # 4. save ------------------------------------------------------------------
@@ -3410,14 +3589,15 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
 
     # 5. posts (founders / recruiters / TA — never staffing feeds) --------------
     _stage("collecting hiring posts")
-    posts_added, post_rejects = ingest_posts(conn, rules, (collect_tal_club, collect_hiring_sheet, collect_hn_hiring,
-                                                           collect_reddit_posts, collect_linkedin_posts, collect_linkedin_apify),
-                                             per_source)
+    post_fns = (collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
+    if SCAN_MODE == "full":
+        post_fns += (collect_linkedin_apify,)
+    posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
 
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
     _stage("re-checking stored jobs")
     try:
-        revet_existing_jobs(rules, limit=60, stale_hours=24)
+        revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.execute("DELETE FROM jobs WHERE link_type='board' AND status!='applied' AND IFNULL(apply_email,'')=''")
         conn.commit()
     except Exception as exc:
@@ -3443,6 +3623,83 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
 
 
 # ─────────────────────────── background discovery loop ──────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLOUD → LOCAL SYNC  (GitHub Actions publishes its jobs.db to the `data` branch; we merge it in)
+# ═══════════════════════════════════════════════════════════════════════════
+_SYNC_TABLES = {"jobs": "job_hash", "posts": "post_hash", "seen_jobs": "url", "rejected_urls": "url",
+                "company_contacts": "company", "ats_boards": None, "careers_pages": "url", "workday_boards": None}
+
+
+def sync_from_cloud() -> dict:
+    """Merge the GitHub-runner database into the local one. Your Applied / Saved / Rejected marks are never touched;
+    jobs the cloud later rejected (closed, filter change) are removed from your 'new' list."""
+    import subprocess
+    import tempfile
+    try:
+        r = subprocess.run(["git", "fetch", "--quiet", "origin", "data"], cwd=str(BASE_DIR), capture_output=True, text=True, timeout=90)
+        if r.returncode != 0:
+            return {"ok": False, "error": (r.stderr or "git fetch failed").strip()[:200]}
+        blob = subprocess.run(["git", "show", "origin/data:jobs.db"], cwd=str(BASE_DIR), capture_output=True, timeout=60)
+        if blob.returncode != 0 or len(blob.stdout) < 1000:
+            return {"ok": False, "error": "no cloud database on the data branch yet"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(blob.stdout)
+    tmp.close()
+    conn = get_db()
+    added_jobs = added_posts = removed = 0
+    try:
+        conn.execute("ATTACH DATABASE ? AS cloud", (tmp.name,))
+        cloud_tables = {r[0] for r in conn.execute("SELECT name FROM cloud.sqlite_master WHERE type='table'")}
+        before_jobs = conn.execute("SELECT COUNT(*) FROM main.jobs").fetchone()[0]
+        before_posts = conn.execute("SELECT COUNT(*) FROM main.posts").fetchone()[0]
+        for table in _SYNC_TABLES:
+            if table not in cloud_tables:
+                continue
+            lc = [r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")]
+            cc = {r[1] for r in conn.execute(f"PRAGMA cloud.table_info({table})")}
+            cols = [c for c in lc if c in cc and c != "id"]
+            if not cols:
+                continue
+            cl = ",".join(cols)
+            conn.execute(f"INSERT OR IGNORE INTO main.{table} ({cl}) SELECT {cl} FROM cloud.{table}")
+        # cloud removed these (closed / now fail a filter) → drop them from the local 'new' list
+        if "rejected_urls" in cloud_tables:
+            for row in conn.execute("SELECT j.id, j.direct_apply_url FROM main.jobs j WHERE j.status='new'").fetchall():
+                if conn.execute("SELECT 1 FROM cloud.rejected_urls WHERE url=?", (norm_url(row["direct_apply_url"]),)).fetchone() \
+                        and not conn.execute("SELECT 1 FROM cloud.jobs WHERE job_hash=?", (make_hash(norm_url(row["direct_apply_url"])),)).fetchone():
+                    conn.execute("DELETE FROM main.jobs WHERE id=?", (row["id"],))
+                    removed += 1
+        # same opening shared by several people → keep the oldest copy
+        conn.execute("""DELETE FROM main.posts WHERE status='new' AND IFNULL(dedup_key,'')!='' AND id NOT IN
+                        (SELECT MIN(id) FROM main.posts WHERE IFNULL(dedup_key,'')!='' GROUP BY dedup_key)""")
+        conn.commit()
+        added_jobs = conn.execute("SELECT COUNT(*) FROM main.jobs").fetchone()[0] - before_jobs + removed
+        added_posts = conn.execute("SELECT COUNT(*) FROM main.posts").fetchone()[0] - before_posts
+        conn.execute("DETACH DATABASE cloud")
+    except Exception as exc:
+        return {"ok": False, "error": f"merge failed: {exc}"}
+    finally:
+        conn.close()
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    return {"ok": True, "new_jobs": max(0, added_jobs), "new_posts": max(0, added_posts), "removed": removed}
+
+
+def _sync_loop() -> None:
+    """While the dashboard is open, quietly merge in whatever the GitHub runner found (every 10 minutes)."""
+    if not (BASE_DIR / ".git").exists() or os.environ.get("AUTO_SYNC", "1") == "0":
+        return
+    time.sleep(6)
+    while True:
+        res = sync_from_cloud()
+        print(f"[sync] {res}")
+        time.sleep(600)
+
 
 def _last_scan_age_secs() -> float:
     conn = get_db()
@@ -3474,6 +3731,9 @@ def _background_loop() -> None:
     """24/7 runner: scan now if the last scan is stale (e.g. after a reboot / the Mac waking up), then keep scanning
     every SCAN_INTERVAL measured from each scan's start. A crashed scan never stops the loop."""
     time.sleep(4)  # let the HTTP server bind first
+    if SCAN_INTERVAL <= 0:
+        print("[loop] local scanning is off (SCAN_INTERVAL_MINUTES=0) — the GitHub runner does the 24/7 scanning")
+        return
     while True:
         age = _last_scan_age_secs()
         if age >= SCAN_INTERVAL - 30:
@@ -3751,8 +4011,8 @@ async function syncCloud(){
   try{
     const r=await fetch('/api/sync',{method:'POST'});
     const d=await r.json();
-    btn.textContent='✅ Synced!';
-    setTimeout(()=>{ btn.textContent='☁️ Sync Cloud'; btn.disabled=false; },2000);
+    btn.textContent = d.ok ? ('✅ '+(d.output||'Synced')) : ('⚠️ '+(d.error||'Sync failed'));
+    setTimeout(()=>{ btn.textContent='☁️ Sync Cloud'; btn.disabled=false; },5000);
   }catch(e){
     btn.textContent='☁️ Sync Cloud'; btn.disabled=false;
   }
@@ -4082,13 +4342,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/sync":
-            import subprocess
-            try:
-                res = subprocess.run(["git", "pull", "--quiet", "origin", "main"],
-                                     cwd=str(BASE_DIR), capture_output=True, text=True, timeout=15)
-                self._json({"ok": True, "output": res.stdout or "Updated"})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)})
+            res = sync_from_cloud()
+            if res.get("ok"):
+                self._json({"ok": True, "output": f"+{res['new_jobs']} jobs, +{res['new_posts']} posts, {res['removed']} closed/removed"})
+            else:
+                self._json({"ok": False, "error": res.get("error", "sync failed")})
             return
 
         if self.path == "/api/scan":
@@ -4108,6 +4366,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Job Hunter v3")
     parser.add_argument("--init-db",    action="store_true")
     parser.add_argument("--scan",       action="store_true", help="Run one-off scan and exit")
+    parser.add_argument("--mode",       choices=["light", "full"], help="With --scan: light = job APIs only, full = everything")
     parser.add_argument("--serve",      action="store_true", help="Start dashboard + discovery loop")
     parser.add_argument("--posts",      action="store_true", help="Pull + vet hiring posts only (LinkedIn via Apify) and exit")
     parser.add_argument("--port",       type=int, default=SERVE_PORT)
@@ -4123,6 +4382,8 @@ def main() -> None:
         print(f"posts added: {added}")
         return
 
+    if args.mode:
+        globals()["SCAN_MODE"] = args.mode
     if args.scan:
         summary = run_full_scan()
         print("Scan complete:", json.dumps(summary, indent=2))
@@ -4131,6 +4392,7 @@ def main() -> None:
     if args.serve or (not args.init_db):
         t = threading.Thread(target=_background_loop, daemon=True)
         t.start()
+        threading.Thread(target=_sync_loop, daemon=True).start()
         host = args.host
         port = args.port
         server = ThreadingHTTPServer((host, port), DashboardHandler)

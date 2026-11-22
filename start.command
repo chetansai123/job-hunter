@@ -53,8 +53,7 @@ else
     done
 fi
 
-# ── 2. Stop any running copy (runner loop + dashboard) ─────────────
-pkill -f "^/bin/bash ./run_forever.sh" 2>/dev/null
+# ── 2. Stop any running copy ───────────────────────────────────────
 OLD_PID=$(lsof -i :$DASHBOARD_PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
 if [ -n "$OLD_PID" ]; then
     echo "🔄  Stopping old dashboard (PID $OLD_PID)..."
@@ -62,10 +61,11 @@ if [ -n "$OLD_PID" ]; then
     sleep 1
 fi
 
-# ── 3. Start the 24/7 runner (auto-restarts the hunter if it ever exits) ─
-echo "🐍  Starting the 24/7 runner on port $DASHBOARD_PORT..."
-nohup ./run_forever.sh >> "$LOG_DIR/job_hunter.log" 2>&1 &
-echo "    runner PID $! — log: logs/job_hunter.log"
+# ── 3. Start the dashboard. Scanning is done 24/7 by the free GitHub runner; the dashboard just
+#       merges its results in (auto every 10 min + the ☁️ Sync Cloud button). Use "Scan Now" for an extra local scan.
+echo "🐍  Starting the dashboard on port $DASHBOARD_PORT..."
+SCAN_INTERVAL_MINUTES=0 nohup python3 -u job_hunter.py --serve --port $DASHBOARD_PORT >> "$LOG_DIR/job_hunter.log" 2>&1 &
+echo "    PID $! — log: logs/job_hunter.log"
 
 # Wait up to 8 s for the dashboard to bind
 for i in $(seq 1 8); do
@@ -90,8 +90,8 @@ echo "  Dashboard : http://127.0.0.1:$DASHBOARD_PORT"
 echo "  Firecrawl : http://localhost:$FIRECRAWL_PORT"
 echo "  Logs      : $(pwd)/logs/"
 echo ""
-echo "  Job Hunter v3 is running in the background."
-echo "  Auto-discovery fires every 30 minutes automatically."
+echo "  Job Hunter dashboard is running."
+echo "  GitHub's free runner finds jobs 24/7; they appear here automatically."
 echo "  Close this window anytime — it won't stop the servers."
 echo "────────────────────────────────────────────────────────"
 echo ""
