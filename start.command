@@ -53,7 +53,8 @@ else
     done
 fi
 
-# ── 2. Kill any existing job_hunter.py on the dashboard port ─────
+# ── 2. Stop any running copy (runner loop + dashboard) ─────────────
+pkill -f "^/bin/bash ./run_forever.sh" 2>/dev/null
 OLD_PID=$(lsof -i :$DASHBOARD_PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
 if [ -n "$OLD_PID" ]; then
     echo "🔄  Stopping old dashboard (PID $OLD_PID)..."
@@ -61,12 +62,10 @@ if [ -n "$OLD_PID" ]; then
     sleep 1
 fi
 
-# ── 3. Start the Python dashboard + background discovery loop ─────
-echo "🐍  Starting job_hunter.py --serve on port $DASHBOARD_PORT..."
-python3 -u job_hunter.py --serve --port $DASHBOARD_PORT \
-    >> "$LOG_DIR/job_hunter.log" 2>&1 &
-JH_PID=$!
-echo "    PID $JH_PID — log: logs/job_hunter.log"
+# ── 3. Start the 24/7 runner (auto-restarts the hunter if it ever exits) ─
+echo "🐍  Starting the 24/7 runner on port $DASHBOARD_PORT..."
+nohup ./run_forever.sh >> "$LOG_DIR/job_hunter.log" 2>&1 &
+echo "    runner PID $! — log: logs/job_hunter.log"
 
 # Wait up to 8 s for the dashboard to bind
 for i in $(seq 1 8); do

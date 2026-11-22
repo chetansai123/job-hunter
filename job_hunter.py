@@ -275,6 +275,8 @@ def init_db() -> None:
         "ALTER TABLE jobs      ADD COLUMN locked INTEGER DEFAULT 0",
         "ALTER TABLE jobs      ADD COLUMN apply_email TEXT DEFAULT ''",
         "ALTER TABLE jobs      ADD COLUMN checked_at TEXT DEFAULT ''",
+        "ALTER TABLE posts     ADD COLUMN dedup_key TEXT DEFAULT ''",
+        "ALTER TABLE posts     ADD COLUMN norm_text TEXT DEFAULT ''",
     ]
     for sql in _migrations:
         try:
@@ -306,6 +308,14 @@ def _purge_and_migrate(conn: sqlite3.Connection) -> None:
                 conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
                 continue
         conn.execute("INSERT OR IGNORE INTO seen_jobs (url, first_seen) VALUES (?,?)", (nu, now_utc()))
+    seen_keys: set[str] = set()
+    for r in conn.execute("SELECT id, post_text, status, dedup_key FROM posts ORDER BY id").fetchall():
+        k = r["dedup_key"] or post_dedup_key(dict(r))
+        if k and k in seen_keys and r["status"] == "new":
+            conn.execute("DELETE FROM posts WHERE id=?", (r["id"],))
+            continue
+        seen_keys.add(k)
+        conn.execute("UPDATE posts SET dedup_key=?, norm_text=? WHERE id=?", (k, " ".join(_post_words(r["post_text"])), r["id"]))
     for r in conn.execute("SELECT url FROM seen_jobs").fetchall():
         conn.execute("INSERT OR IGNORE INTO seen_jobs (url, first_seen) VALUES (?,?)", (norm_url(r["url"]), now_utc()))
     conn.commit()
@@ -1078,21 +1088,62 @@ def insert_job(conn: sqlite3.Connection, job: dict) -> bool:
     return True
 
 
+_ROLE_PHRASE = re.compile(r"\b((?:senior |junior |sr\.? |jr\.? )?(?:react(?:\.?js)?|node(?:\.?js)?|next\.?js|mern|mean|full[\s-]?stack|front[\s-]?end|"
+                          r"back[\s-]?end|javascript|typescript|software|web|sde|founding|product|ui)\s*(?:-|/|\s)?\s*"
+                          r"(?:developer|engineer|dev|sde|intern)s?)\b", re.I)
+_MAIL_ANY = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}", re.I)
+
+
+def _post_words(text: str) -> list[str]:
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    t = re.sub(r"https?://\S+|#\w+|@\w+|[^a-z0-9 ]+", " ", t)
+    return t.split()[:160]
+
+
+def post_dedup_key(post: dict) -> str:
+    """Same opening shared by many people → one key: the apply e-mail + the role, else the post's core wording."""
+    text = unicodedata.normalize("NFKC", post.get("post_text") or "").lower()
+    role = _ROLE_PHRASE.search(text)
+    role_k = re.sub(r"[^a-z]+", "", role.group(1)) if role else ""
+    mails = [m.group(0) for m in _MAIL_ANY.finditer(text) if not any(b in m.group(0) for b in _BAD_MAIL)]
+    if mails:
+        return f"mail:{mails[0]}|{role_k}"
+    words = _post_words(text)
+    return "txt:" + hashlib.md5(" ".join(words[:60]).encode()).hexdigest() if words else ""
+
+
+def _shingles(words: list[str], n: int = 5) -> set:
+    return {" ".join(words[i:i + n]) for i in range(max(0, len(words) - n + 1))}
+
+
 def insert_post(conn: sqlite3.Connection, post: dict) -> bool:
+    """Skip exact repeats (same URL), the same opening reposted by others (same apply e-mail + role),
+    and near-copies (≥ 60% identical wording to a post from the last 45 days)."""
     h = make_hash(post.get("post_url", ""), post.get("post_text", "")[:80])
     if conn.execute("SELECT id FROM posts WHERE post_hash=?", (h,)).fetchone():
         return False
+    key = post_dedup_key(post)
+    if key and conn.execute("SELECT id FROM posts WHERE dedup_key=?", (key,)).fetchone():
+        return False
+    words = _post_words(post.get("post_text", ""))
+    sh = _shingles(words)
+    if len(sh) >= 8:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        for r in conn.execute("SELECT norm_text FROM posts WHERE created_at >= ? AND norm_text != ''", (cutoff,)):
+            other = _shingles(r["norm_text"].split())
+            if other and len(sh & other) / max(1, min(len(sh), len(other))) >= 0.6:
+                return False
     conn.execute("""
         INSERT INTO posts (
             post_hash,source,poster_name,poster_role,poster_url,
             post_url,post_text,skills_found,location,posted_at,
-            status,created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            status,created_at,dedup_key,norm_text
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (h, post.get("source",""), post.get("poster_name",""),
          post.get("poster_role",""), post.get("poster_url",""),
          post.get("post_url",""), post.get("post_text","")[:2000],
          post.get("skills_found",""), post.get("location",""),
-         post.get("posted_at",""), "new", now_utc()))
+         post.get("posted_at",""), "new", now_utc(), key, " ".join(words)))
     conn.commit()
     return True
 
@@ -3393,28 +3444,52 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
 
 # ─────────────────────────── background discovery loop ──────────────────────
 
-def _background_loop() -> None:
-    """Daemon thread: boot scan if DB sparse, then scans every SCAN_INTERVAL seconds."""
-    time.sleep(4)  # let the HTTP server bind first
+def _last_scan_age_secs() -> float:
     conn = get_db()
-    job_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    conn.close()
-    if job_count < BOOT_SCAN_BELOW:
-        print(f"[loop] only {job_count} jobs in DB → running immediate boot scan...")
-        try:
-            run_full_scan()
-        except Exception as exc:
-            print(f"[loop] boot scan crashed: {exc}")
-    else:
-        print(f"[loop] {job_count} jobs found → skipping boot scan")
+    try:
+        r = conn.execute("SELECT finished_at FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    if not r or not r["finished_at"]:
+        return float("inf")
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(r["finished_at"])).total_seconds()
+    except Exception:
+        return float("inf")
+
+
+def notify(title: str, message: str) -> None:
+    """macOS desktop notification (no-op elsewhere)."""
+    try:
+        import platform
+        import subprocess
+        if platform.system() == "Darwin":
+            subprocess.run(["osascript", "-e", f'display notification "{message}" with title "{title}" sound name "Glass"'],
+                           timeout=10, capture_output=True)
+    except Exception:
+        pass
+
+
+def _background_loop() -> None:
+    """24/7 runner: scan now if the last scan is stale (e.g. after a reboot / the Mac waking up), then keep scanning
+    every SCAN_INTERVAL measured from each scan's start. A crashed scan never stops the loop."""
+    time.sleep(4)  # let the HTTP server bind first
     while True:
-        print(f"[loop] sleeping {SCAN_INTERVAL//60} min until next scan...")
-        time.sleep(SCAN_INTERVAL)
-        print("[loop] starting scheduled scan...")
-        try:
-            run_full_scan()
-        except Exception as exc:                      # one bad scan must never kill the 24/7 loop
-            print(f"[loop] scan crashed: {exc}")
+        age = _last_scan_age_secs()
+        if age >= SCAN_INTERVAL - 30:
+            print(f"[loop] last scan {('never' if age == float('inf') else f'{int(age // 60)} min ago')} → scanning now")
+            t0 = time.time()
+            try:
+                s = run_full_scan()
+                if not s.get("busy") and (s.get("jobs_added") or s.get("posts_added")):
+                    notify("Job Hunter", f"{s.get('jobs_added', 0)} new jobs · {s.get('posts_added', 0)} new posts")
+            except Exception as exc:
+                print(f"[loop] scan crashed: {exc}")
+            wait = max(300, SCAN_INTERVAL - (time.time() - t0))
+        else:
+            wait = max(60, SCAN_INTERVAL - age)
+        print(f"[loop] next scan in {int(wait // 60)} min")
+        time.sleep(wait)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
