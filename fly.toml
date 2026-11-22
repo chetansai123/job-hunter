@@ -1,5 +1,5 @@
 # fly.toml — Fly.io config for Job Hunter v3
-# Free tier: 2 shared-cpu VMs + 3 GB persistent volume (always-on, no sleep)
+# Always-on VM + 1 GB volume. Roughly $5-7/month — check fly.io/docs/about/pricing for current prices.
 # Deploy: flyctl deploy  (from this folder)
 
 app     = "job-hunter"      # change to your preferred app name
@@ -12,7 +12,7 @@ primary_region = "sin"      # Singapore — closest to India
   HOST                   = "0.0.0.0"
   PORT                   = "8080"
   SCAN_INTERVAL_MINUTES  = "30"
-  # Set secrets separately: flyctl secrets set GEMINI_API_KEY=xxx FIRECRAWL_API_URL=https://...
+  # Secrets (APIFY_TOKEN, DASH_PASSWORD, ...) are set by deploy_cloud.sh — never put them in this file.
 
 [http_service]
   internal_port       = 8080
@@ -22,7 +22,8 @@ primary_region = "sin"      # Singapore — closest to India
   min_machines_running = 1
 
 [[vm]]
-  size = "shared-cpu-1x"   # free tier VM
+  size   = "shared-cpu-1x"
+  memory = "1gb"
 
 [[mounts]]
   source      = "job_hunter_data"
@@ -36,6 +37,6 @@ primary_region = "sin"      # Singapore — closest to India
     grace_period = "30s"
     interval     = "30s"
     method       = "get"
-    path         = "/api/stats"
+    path         = "/healthz"
     protocol     = "http"
     timeout      = "5s"

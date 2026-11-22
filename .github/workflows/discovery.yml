@@ -1,10 +1,10 @@
 name: 24/7 Job & Post Discovery
 
 on:
-  schedule:
-    # Every 30 minutes around the clock — GitHub Actions runs this even
-    # when your MacBook is off, sleeping, or in your bag.
-    - cron: '*/30 * * * *'
+  # The always-on cloud host (Fly.io, see deploy_cloud.sh) now does the scanning, so the schedule is off to
+  # avoid two writers on jobs.db. Re-enable the cron below only if you are NOT using the cloud host.
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:   # Manual trigger from GitHub UI anytime
 
 permissions:

@@ -1281,7 +1281,7 @@ def extract_location(text: str) -> str:
 _CHROME = next((c for c in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
                             "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser") if os.path.exists(c)), "")
-_CHROME_SEM = threading.Semaphore(3)
+_CHROME_SEM = threading.Semaphore(int(os.environ.get("CHROME_CONCURRENCY", "3")))
 
 
 def chrome_render(url: str, budget_ms: int = 9000) -> str:
@@ -1291,7 +1291,7 @@ def chrome_render(url: str, budget_ms: int = 9000) -> str:
     import subprocess
     with _CHROME_SEM:
         try:
-            r = subprocess.run([_CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+            r = subprocess.run([_CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--hide-scrollbars",
                                 f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
                                capture_output=True, timeout=45)
             return r.stdout.decode("utf-8", "replace")
@@ -3976,7 +3976,30 @@ setInterval(()=>{ if(!scanTimer) refresh(); }, 60000);   // auto-refresh so new 
 
 # ─────────────────────────── HTTP server ────────────────────────────────────
 
+DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        """When DASH_PASSWORD is set (cloud deploy), every request needs HTTP Basic auth (any user name)."""
+        if not DASH_PASSWORD or self.path.split("?")[0] == "/healthz":
+            return True
+        import base64
+        import hmac
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Basic "):
+            try:
+                pw = base64.b64decode(hdr[6:]).decode("utf-8", "replace").split(":", 1)[-1]
+                if hmac.compare_digest(pw, DASH_PASSWORD):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Job Hunter"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def _json(self, data: object, code: int = 200) -> None:
         body = json.dumps(data).encode()
         self.send_response(code)
@@ -3987,6 +4010,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
+        if path == "/healthz":
+            self._json({"ok": True})
+            return
+        if not self._authorized():
+            return
 
         if path == "/api/jobs":
             conn = get_db()
@@ -4028,6 +4056,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
+        if not self._authorized():
+            return
         origin = self.headers.get("Origin", "")
         if origin and not re.match(r"https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$", origin) and SERVE_HOST in ("127.0.0.1", "localhost"):
             self._json({"error": "forbidden origin"}, 403)
