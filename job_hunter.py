@@ -236,6 +236,15 @@ def init_db() -> None:
             PRIMARY KEY (kind, token)
         );
 
+        CREATE TABLE IF NOT EXISTS li_companies (
+            slug         TEXT PRIMARY KEY,
+            name         TEXT DEFAULT '',
+            last_checked TEXT DEFAULT '',
+            posts_seen   INTEGER DEFAULT 0,
+            hiring_found INTEGER DEFAULT 0,
+            failures     INTEGER DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS workday_boards (
             host     TEXT NOT NULL,
             tenant   TEXT NOT NULL,
@@ -2179,7 +2188,10 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
             if jid in seen_ids:
                 continue
             seen_ids.add(jid)
+            slug_m = re.search(r'linkedin\.com/company/([^"?/]+)', comp)
             comp = re.sub(r"<[^>]+>", "", comp).strip()
+            if slug_m:
+                _li_register_company(slug_m.group(1), comp)
             title = htmllib.unescape(re.sub(r"<[^>]+>", "", title)).strip()
             loc = htmllib.unescape(loc).strip()
             if not _board_ok(title, comp, loc, rules) or not _fresh_enough(date or "", rules):
@@ -2196,13 +2208,20 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
         time.sleep(0.5)
         m = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', h or "", re.S)
         jd = _html_to_text(m.group(1)) if m else ""
-        return c, jd
+        poster = None                                       # "Direct message the job poster" = the real recruiter / hiring manager
+        pm = re.search(r'message-the-recruiter.*?href="(https://[a-z.]*linkedin\.com/in/[^"?]+)[^"]*".*?<span class="sr-only">\s*([^<]+?)\s*(?:<|$)',
+                       h or "", re.S)
+        if pm:
+            poster = {"url": pm.group(1).replace("in.linkedin.com", "www.linkedin.com"), "name": htmllib.unescape(pm.group(2)).strip()}
+        return c, jd, poster
     with ThreadPoolExecutor(3) as ex:
-        for (jid, title, comp, loc, date), jd in ex.map(detail, cards):
+        for (jid, title, comp, loc, date), jd, poster in ex.map(detail, cards):
             if len(jd) < 200:
                 continue
-            out.append(_job(comp, title, f"https://www.linkedin.com/jobs/view/{jid}", "linkedin_jobs", rules,
-                            location=loc, date=date, jd_text=jd, board="LinkedIn", reason="LinkedIn Jobs"))
+            j = _job(comp, title, f"https://www.linkedin.com/jobs/view/{jid}", "linkedin_jobs", rules,
+                     location=loc, date=date, jd_text=jd, board="LinkedIn", reason="LinkedIn Jobs")
+            j["li_poster"] = poster
+            out.append(j)
     print(f"[linkedin-jobs] {len(cards)} cards → {len(out)} with full JD")
     return out
 
@@ -2500,6 +2519,90 @@ def collect_linkedin_search(rules: dict) -> list[dict]:
         if p:
             out.append(p)
     print(f"  → {len(out)} readable posts")
+    return out
+
+
+# ── LinkedIn company pages (public, no login): ~10 recent posts per page in one request ─────────────
+def _li_register_company(slug: str, name: str = "") -> None:
+    if not slug or len(slug) > 80:
+        return
+    conn = get_db()
+    try:
+        conn.execute("INSERT OR IGNORE INTO li_companies (slug, name) VALUES (?,?)", (slug.lower(), name))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _li_company_page_posts(slug: str) -> tuple[list[dict] | None, int]:
+    u = f"https://www.linkedin.com/company/{slug}/posts/"
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            body = r.read(900_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return None, e.code
+    except Exception:
+        return None, 0
+    out = []
+    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', body, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except ValueError:
+            continue
+        for node in (d.get("@graph") if isinstance(d, dict) else None) or []:
+            if isinstance(node, dict) and node.get("@type") == "SocialMediaPosting":
+                a = node.get("author") or {}
+                out.append({"name": a.get("name", ""), "url": a.get("url", ""),
+                            "post_url": (node.get("url") or node.get("mainEntityOfPage") or "").split("?")[0],
+                            "text": unicodedata.normalize("NFKC", node.get("text", "") or ""),
+                            "date": (node.get("datePublished") or "")[:10]})
+    return out, 200
+
+
+def collect_linkedin_companies(rules: dict) -> list[dict]:
+    """Hiring posts that companies publish on their own LinkedIn page. The company list = every company seen hiring
+    JavaScript people on LinkedIn Jobs; each full scan checks the least-recently-checked ones."""
+    per_run = int(os.environ.get("LI_COMPANIES_PER_RUN", "120"))
+    conn = get_db()
+    rows = conn.execute("SELECT slug, name FROM li_companies WHERE failures < 4 ORDER BY last_checked ASC LIMIT ?", (per_run,)).fetchall()
+    known = {r[0] for r in conn.execute("SELECT post_url FROM posts")}
+    conn.close()
+    out: list[dict] = []
+    blocked = 0
+    seen_posts = 0
+    max_days = rules.get("freshness", {}).get("max_age_days", 40)
+    for r in rows:
+        posts, code = _li_company_page_posts(r["slug"])
+        conn = get_db()
+        if posts is None:
+            blocked = blocked + 1 if code in (429, 999) else 0
+            conn.execute("UPDATE li_companies SET failures=failures+?, last_checked=? WHERE slug=?",
+                         (0 if code in (429, 999) else 1, now_utc(), r["slug"]))
+            conn.commit(); conn.close()
+            if blocked >= 3:
+                print("[linkedin-companies] LinkedIn is rate-limiting this IP — stopping early")
+                break
+            time.sleep(2)
+            continue
+        blocked = 0
+        found = 0
+        for p in posts:
+            seen_posts += 1
+            if not p["text"] or p["post_url"] in known or (p["date"] and (days_ago(p["date"]) or 0) > max_days):
+                continue
+            if is_staffing_company(p["name"], rules):
+                continue
+            out.append({"source": "LinkedIn", "poster_name": p["name"] or r["name"], "poster_role": "Company page",
+                        "poster_url": p["url"] or f"https://www.linkedin.com/company/{r['slug']}", "post_url": p["post_url"],
+                        "post_text": p["text"][:1800], "skills_found": _extract_skills(p["text"], rules), "location": "",
+                        "posted_at": p["date"], "_headline": None})
+            found += 1
+        conn.execute("UPDATE li_companies SET last_checked=?, posts_seen=posts_seen+?, hiring_found=hiring_found+? WHERE slug=?",
+                     (now_utc(), len(posts), found, r["slug"]))
+        conn.commit(); conn.close()
+        time.sleep(1.0)
+    print(f"[linkedin-companies] {len(rows)} company pages → {seen_posts} posts read, {len(out)} new candidates")
     return out
 
 
@@ -3401,7 +3504,7 @@ def ingest_posts(conn: sqlite3.Connection, rules: dict, fns, per_source: dict | 
             for post in found:
                 ok_post, why = vet_post(post, rules)
                 head = post.get("_headline")
-                if head is None and post.get("source") in ("LinkedIn", "X/Twitter") and post.get("poster_role"):
+                if head is None and post.get("source") in ("LinkedIn", "X/Twitter") and post.get("poster_role") and post["poster_role"] != "Company page":
                     head = post["poster_role"]
                 if ok_post and head and re.search(r"open to (?:new )?(?:opportunit|work|roles)|looking for (?:new |my next )?(?:opportunit|role|job)|seeking (?:new )?(?:opportunit|role)", head.lower()):
                     ok_post, why = False, "author is a job-seeker"
@@ -3501,7 +3604,7 @@ def revet_existing_posts(rules: dict) -> int:
     for r in rows:
         ok, _ = vet_post(dict(r), rules)
         head = r["poster_role"] or ""
-        if ok and r["source"] in ("LinkedIn", "X/Twitter") and head:
+        if ok and r["source"] in ("LinkedIn", "X/Twitter") and head and head != "Company page":
             if (not _POSTER_TITLE.search(head)) or _FEED_HEADLINE.search(head) or is_staffing_company(head, rules) \
                     or re.search(r"executive search|consultanc|staffing|recruitment (?:firm|agency)|open to (?:new )?opportunit", head.lower()):
                 ok = False
@@ -3814,6 +3917,11 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             company_contacts = build_contacts(conn, job["company"], use_search=contact_searches < 12)
             if fc_search_available():
                 contact_searches += 1
+            if job.get("li_poster"):
+                lp = job["li_poster"]
+                company_contacts = [{"role": "Job poster (recruiter)", "name": lp["name"], "url": lp["url"], "kind": "profile",
+                                     "note": "The person who posted this exact role on LinkedIn — message them first"}] + \
+                                   [c for c in company_contacts if c.get("url") != lp["url"]]
             job["contacts"] = json.dumps(company_contacts)
             alts = [u for u in job.get("_alt", []) if not is_aggregator(u)]
             if alts:
@@ -3835,7 +3943,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _stage("collecting hiring posts")
     post_fns = (collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
     if SCAN_MODE == "full":
-        post_fns += (collect_linkedin_search, collect_linkedin_apify)
+        post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
 
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)

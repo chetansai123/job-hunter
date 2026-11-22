@@ -3,12 +3,13 @@ name: 24/7 Job & Post Discovery
 # Free GitHub-hosted runner does the scanning while your Mac is off.
 #   light scan  every 30 minutes → job APIs (Greenhouse, Lever, Ashby, Workday, remote boards …) + HN/Reddit posts   ~3 min
 #   full scan   every 3 hours    → + LinkedIn jobs, company career pages (Playwright browser), LinkedIn post search  ~15 min
-# GitHub may start scheduled runs a few minutes late when it is busy.
+# GitHub's own scheduler fires erratically (observed: every 5-8 h), so an external free cron (cron-job.org) calls the
+# workflow_dispatch API every 30 min (light) and every 3 h (full). The schedule above is only a backup.
 # Results go to the `data` branch (one commit, history discarded) so the repo never bloats; the dashboard's
 # "Sync Cloud" button / auto-sync merges them into your local database without touching Applied/Saved marks.
 on:
   schedule:
-    - cron: '*/30 * * * *'      # light scan every 30 minutes (job APIs, Workday, remote boards, HN/Reddit posts)  ~3 min
+    - cron: '3 * * * *'         # backup only: hourly light scan (GitHub's scheduler is unreliable; cron-job.org triggers every 30 min)
     - cron: '17 */3 * * *'      # full scan every 3 hours (+ LinkedIn jobs, career pages in a real browser, LinkedIn post search)  ~15 min
   workflow_dispatch:
     inputs:
