@@ -236,6 +236,18 @@ def init_db() -> None:
             PRIMARY KEY (kind, token)
         );
 
+        CREATE TABLE IF NOT EXISTS discovered_companies (
+            key        TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            website    TEXT DEFAULT '',
+            source     TEXT DEFAULT '',
+            info       TEXT DEFAULT '{}',
+            first_seen TEXT NOT NULL,
+            checked_at TEXT DEFAULT '',
+            board      TEXT DEFAULT '',
+            status     TEXT DEFAULT 'new'
+        );
+
         CREATE TABLE IF NOT EXISTS startups (
             key          TEXT PRIMARY KEY,
             name         TEXT NOT NULL,
@@ -310,6 +322,7 @@ def init_db() -> None:
         "ALTER TABLE jobs      ADD COLUMN apply_email TEXT DEFAULT ''",
         "ALTER TABLE jobs      ADD COLUMN checked_at TEXT DEFAULT ''",
         "ALTER TABLE posts     ADD COLUMN dedup_key TEXT DEFAULT ''",
+        "ALTER TABLE ats_boards ADD COLUMN last_polled TEXT DEFAULT ''",
         "ALTER TABLE posts     ADD COLUMN norm_text TEXT DEFAULT ''",
     ]
     for sql in _migrations:
@@ -2875,17 +2888,24 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
 
 
 def collect_ats_boards(rules: dict) -> list[dict]:
-    boards: set[tuple[str, str]] = set()
+    """Polls company boards in rotation (least recently polled first) so the list can grow to thousands."""
+    conn = get_db()
     for kind, toks in rules.get("ats_boards", {}).items():
         if isinstance(toks, list):
-            boards.update((kind, t.lower()) for t in toks)
-    conn = get_db()
-    for r in conn.execute("SELECT kind, token FROM ats_boards WHERE failures < 3"):
-        boards.add((r["kind"], r["token"]))
+            for t in toks:
+                conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, t.lower(), "seed", now_utc()))
+    conn.commit()
+    limit = int(os.environ.get("BOARDS_PER_RUN", "1500" if SCAN_MODE != "light" else "450"))
+    total = conn.execute("SELECT COUNT(*) FROM ats_boards WHERE failures < 3").fetchone()[0]
+    boards = [(r["kind"], r["token"]) for r in conn.execute(
+        "SELECT kind, token FROM ats_boards WHERE failures < 3 ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (limit,))]
+    stamp = now_utc()
+    conn.executemany("UPDATE ats_boards SET last_polled=? WHERE kind=? AND token=?", [(stamp, k, t) for k, t in boards])
+    conn.commit()
     conn.close()
-    print(f"[ats-boards] polling {len(boards)} Greenhouse/Lever/Ashby boards...")
-    with ThreadPoolExecutor(8) as ex:
-        results = list(ex.map(lambda b: _fetch_board(b, rules), sorted(boards)))
+    print(f"[ats-boards] polling {len(boards)} of {total} company boards (rotation)...")
+    with ThreadPoolExecutor(10) as ex:
+        results = list(ex.map(lambda b: _fetch_board(b, rules), boards))
     out = [j for r in results for j in r]
     print(f"  → {len(out)} candidate roles (India/remote-eligible, title-filtered)")
     return out
@@ -3751,6 +3771,7 @@ _STATIC_SHIM = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{di
     if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
     if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
     if(u==='/api/startups') return json((DATA.startups||[]).map(s=>({...s,status:m['s'+s.key]||'new'})));
+    if(u==='/api/meta') return json(DATA.meta.discovery||{});
     if(u==='/api/status'){ const b=JSON.parse(opts.body);
       if(b.type==='startup'){ m['s'+b.id]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); return json({ok:true}); }
       const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
@@ -3783,6 +3804,7 @@ _STATIC_SHIM_OPEN = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()
     if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
     if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
     if(u==='/api/startups') return json((DATA.startups||[]).map(s=>({...s,status:m['s'+s.key]||'new'})));
+    if(u==='/api/meta') return json(DATA.meta.discovery||{});
     if(u==='/api/status'){ const b=JSON.parse(opts.body);
       if(b.type==='startup'){ m['s'+b.id]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); return json({ok:true}); }
       const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
@@ -3817,7 +3839,8 @@ def export_static(outdir: str) -> bool:
         ((datetime.now() - timedelta(days=183)).strftime("%Y-%m-%d"),))]
     last = conn.execute("SELECT finished_at FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
-    meta = {"generated_at": now_utc(), "last_scan": (last["finished_at"] if last else ""), "jobs": len(jobs), "posts": len(posts)}
+    meta = {"generated_at": now_utc(), "last_scan": (last["finished_at"] if last else ""), "jobs": len(jobs), "posts": len(posts),
+            "discovery": discovery_meta()}
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     payload = {"jobs": jobs, "posts": posts, "startups": startups, "meta": meta}
@@ -4043,6 +4066,13 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
+
+    if not custom_urls and (SCAN_MODE == "discovery" or (SCAN_MODE == "full" and _due("discovery_run", 23))):
+        _stage("discovery: finding new companies")
+        try:
+            per_source["discovery"] = run_discovery(rules).get("boards_added", 0)
+        except Exception as exc:
+            print(f"  [!] discovery failed: {exc}")
 
     if SCAN_MODE == "full" and not custom_urls:
         _stage("funded startups")
@@ -4313,6 +4343,228 @@ def collect_funded_startups(rules: dict) -> int:
     conn.close()
     print(f"[startups] enriched {sum(1 for _, d in results if d)} · {total} funded startups (last 6 months) in the list")
     return total
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DISCOVERY ENGINE  (once a day: find NEW companies, detect their job board, add it to the polling list)
+#  Sources: YC directory (companies hiring India/remote), remote-company list (remoteintech), funding news,
+#  every company seen on LinkedIn Jobs, and weekly a Common Crawl sweep of ATS hostnames.
+# ═══════════════════════════════════════════════════════════════════════════
+DISCOVERY_PER_DAY = int(os.environ.get("DISCOVERY_COMPANIES_PER_DAY", "400"))
+
+
+def _disc_add(conn: sqlite3.Connection, name: str, website: str, source: str, info: dict | None = None) -> bool:
+    key = _skey(name) or _netloc(website).replace(".", "")
+    if not key:
+        return False
+    cur = conn.execute("INSERT OR IGNORE INTO discovered_companies (key, name, website, source, info, first_seen) VALUES (?,?,?,?,?,?)",
+                       (key, name.strip()[:120], (website or "").strip()[:300], source, json.dumps(info or {}), now_utc()))
+    return cur.rowcount > 0
+
+
+def _discover_yc() -> list[tuple[str, str, dict]]:
+    h = http_get_text("https://www.ycombinator.com/companies", 25, quiet=True)
+    m = re.search(r"window\.AlgoliaOpts\s*=\s*(\{.*?\});", h or "")
+    if not m:
+        return []
+    o = json.loads(m.group(1))
+    out = []
+    for flt in ('isHiring:true AND regions:"India"', 'isHiring:true AND regions:"Remote"', 'isHiring:true AND regions:"Asia"'):
+        for page in range(0, 12):
+            body = json.dumps({"requests": [{"indexName": "YCCompany_production",
+                                             "params": f"hitsPerPage=100&page={page}&filters={urllib.parse.quote(flt)}"}]}).encode()
+            try:
+                req = urllib.request.Request(f"https://{o['app'].lower()}-dsn.algolia.net/1/indexes/*/queries", data=body, method="POST",
+                                             headers={"x-algolia-application-id": o["app"], "x-algolia-api-key": o["key"],
+                                                      "Content-Type": "application/json", "User-Agent": BROWSER_UA})
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    res = json.loads(r.read())["results"][0]
+            except Exception:
+                break
+            for hit in res.get("hits", []):
+                out.append((hit.get("name", ""), hit.get("website", ""),
+                            {"yc": hit.get("batch", ""), "locations": hit.get("all_locations", ""), "team": hit.get("team_size", ""),
+                             "about": hit.get("one_liner", ""), "yc_url": f"https://www.ycombinator.com/companies/{hit.get('slug', '')}"}))
+            if page >= res.get("nbPages", 1) - 1:
+                break
+    return out
+
+
+def _discover_remoteintech() -> list[tuple[str, str, dict]]:
+    import io
+    import tarfile
+    try:
+        req = urllib.request.Request("https://codeload.github.com/remoteintech/remote-jobs/tar.gz/refs/heads/main", headers={"User-Agent": "job-hunter"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            tf = tarfile.open(fileobj=io.BytesIO(r.read()), mode="r:gz")
+    except Exception:
+        return []
+    out = []
+    for m in tf.getmembers():
+        if "/src/companies/" not in m.name or not m.name.endswith(".md"):
+            continue
+        fm = tf.extractfile(m).read().decode("utf-8", "replace").split("---")
+        meta = fm[1] if len(fm) > 2 else ""
+        g = lambda k: (re.search(rf"^{k}:\s*\"?([^\"\n]+)\"?\s*$", meta, re.M) or [None, ""])[1].strip()
+        region = g("region").lower()
+        if region and not re.search(r"worldwide|global|asia|india|apac|anywhere", region):
+            continue                                                       # Europe-only / US-only companies are skipped
+        out.append((g("title"), g("website"), {"careers": g("careers_url"), "region": region}))
+    return out
+
+
+def _discover_news() -> list[tuple[str, str, dict]]:
+    out = []
+    for feed in ("https://economictimes.indiatimes.com/tech/funding/rssfeeds/78570540.cms", "https://yourstory.com/feed"):
+        x = http_get_text(feed, 25, quiet=True)
+        for t in re.findall(r"<item>.*?<title>(.*?)</title>", x or "", re.S):
+            t = htmllib.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", t)).strip()
+            m = re.search(r"^(?:[\w\-]+\s+(?:startup|platform|firm|company|player|unicorn)\s+)?([A-Z][\w.&'\-]*(?:\s+[A-Z][\w.&'\-]*){0,3})\s+"
+                          r"(?:raises|secures|bags|nets|closes|gets)\b", t)
+            if m and len(m.group(1)) > 2:
+                out.append((m.group(1), "", {"news": t[:140]}))
+    return out
+
+
+_CC_DOMAINS = {"keka": "keka.com", "zoho": "zohorecruit.in", "ashby": "jobs.ashbyhq.com", "lever": "jobs.lever.co",
+               "greenhouse": "boards.greenhouse.io", "workday": "myworkdayjobs.com"}
+
+
+def _discover_commoncrawl() -> list[str]:
+    """Weekly best effort: every ATS / Workday URL Common Crawl saw → board URLs (its free index is often overloaded)."""
+    try:
+        coll = json.loads(http_get_text("https://index.commoncrawl.org/collinfo.json", 30, quiet=True) or "[]")[0]["id"]
+    except Exception:
+        return []
+    urls: list[str] = []
+    for kind, dom in _CC_DOMAINS.items():
+        for attempt in range(2):
+            t = http_get_text(f"https://index.commoncrawl.org/{coll}-index?url={urllib.parse.quote(dom)}&matchType=domain"
+                              f"&output=json&fl=url&limit=5000", 120, quiet=True)
+            if t and t.lstrip().startswith("{"):
+                urls += [json.loads(l)["url"] for l in t.splitlines() if l.startswith("{")]
+                break
+            time.sleep(20)
+    return urls
+
+
+def detect_board(name: str, website: str, careers: str = "") -> str:
+    """'kind:token' / 'workday:host|tenant|site' for the company's job board, or '' — careers link first, then name slugs."""
+    for u in [careers] if careers else []:
+        ab, wb = ats_board_from_url(u), workday_board_from_url(u)
+        if ab:
+            return f"{ab[0]}:{ab[1]}"
+        if wb:
+            return "workday:" + "|".join(wb)
+    if website:
+        base = (website if website.startswith("http") else "https://" + website).rstrip("/")
+        for path in ("/careers", "/jobs", ""):
+            h = http_get_text(base + path, 10, quiet=True)
+            for href in re.findall(r'href="([^"#]+)"', h or ""):
+                u = urllib.parse.urljoin(base + path, htmllib.unescape(href))
+                ab, wb = ats_board_from_url(u), workday_board_from_url(u)
+                if ab:
+                    return f"{ab[0]}:{ab[1]}"
+                if wb:
+                    return "workday:" + "|".join(wb)
+    stems = list(dict.fromkeys(_slug_candidates(name)[:2] + ([_netloc(website).split(".")[0]] if website else [])))
+    for st in stems:
+        for kind in ("greenhouse", "lever", "ashby", "keka", "zoho", "workable", "recruitee", "smartrecruiters"):
+            if _ats_postings(kind, st):                                     # board exists AND has open roles
+                return f"{kind}:{st}"
+    return ""
+
+
+def _register_detected(conn: sqlite3.Connection, board: str, source: str) -> None:
+    kind, _, tok = board.partition(":")
+    if kind == "workday":
+        host, tenant, site = tok.split("|")
+        conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)", (host, tenant, site, source))
+    elif kind in ("greenhouse", "lever", "ashby", "keka", "zoho"):
+        conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, tok, source, now_utc()))
+    # workable / recruitee / smartrecruiters are used for link resolution only (no bulk poller yet)
+
+
+def run_discovery(rules: dict) -> dict:
+    t0 = time.time()
+    conn = get_db()
+    before_boards = conn.execute("SELECT COUNT(*) FROM ats_boards").fetchone()[0] + conn.execute("SELECT COUNT(*) FROM workday_boards").fetchone()[0]
+    added: dict[str, int] = {}
+    for src, fn in (("yc", _discover_yc), ("remoteintech", _discover_remoteintech), ("news", _discover_news)):
+        try:
+            rows = fn()
+        except Exception as exc:
+            print(f"  [discovery ✗] {src}: {exc}")
+            rows = []
+        added[src] = sum(_disc_add(conn, n, w, src, i) for n, w, i in rows if n)
+    li = conn.execute("SELECT slug, name FROM li_companies").fetchall()
+    added["linkedin"] = sum(_disc_add(conn, r["name"] or r["slug"], "", "linkedin", {"li_slug": r["slug"]}) for r in li if (r["name"] or r["slug"]))
+    conn.commit()
+    if _due("discovery_commoncrawl", 24 * 7):
+        urls = _discover_commoncrawl()
+        n = 0
+        for u in urls:
+            ab, wb = ats_board_from_url(u), workday_board_from_url(u)
+            if ab and ab[0] in ("greenhouse", "lever", "ashby", "keka", "zoho"):
+                n += conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)",
+                                  (ab[0], ab[1], "discovery:commoncrawl", now_utc())).rowcount
+            elif wb:
+                n += conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)",
+                                  (*wb, "discovery:commoncrawl")).rowcount
+        conn.commit()
+        added["commoncrawl_boards"] = n
+        if urls:
+            _kv_set("discovery_commoncrawl", now_utc())
+    todo = conn.execute("""SELECT key, name, website, source, info FROM discovered_companies WHERE status='new'
+                           ORDER BY CASE source WHEN 'yc' THEN 0 WHEN 'remoteintech' THEN 1 WHEN 'news' THEN 2 ELSE 3 END, first_seen
+                           LIMIT ?""", (DISCOVERY_PER_DAY,)).fetchall()
+    conn.close()
+
+    def work(r):
+        try:
+            info = json.loads(r["info"] or "{}")
+            return r["key"], r["source"], detect_board(r["name"], r["website"], info.get("careers", ""))
+        except Exception:
+            return r["key"], r["source"], ""
+
+    with ThreadPoolExecutor(12) as ex:
+        results = list(ex.map(work, todo))
+    conn = get_db()
+    found = 0
+    for key, src, board in results:
+        if board:
+            _register_detected(conn, board, f"discovery:{src}")
+            found += 1
+        conn.execute("UPDATE discovered_companies SET status=?, board=?, checked_at=? WHERE key=?",
+                     ("board" if board else "none", board, now_utc(), key))
+    conn.commit()
+    after_boards = conn.execute("SELECT COUNT(*) FROM ats_boards").fetchone()[0] + conn.execute("SELECT COUNT(*) FROM workday_boards").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM discovered_companies WHERE status='new'").fetchone()[0]
+    conn.close()
+    summary = {"date": now_utc()[:10], "new_companies": added, "checked": len(todo), "boards_found": found,
+               "boards_added": after_boards - before_boards, "boards_total": after_boards, "pending": pending,
+               "minutes": round((time.time() - t0) / 60, 1)}
+    hist = json.loads(_kv_get("discovery_history") or "[]")[-29:] + [summary]
+    _kv_set("discovery_history", json.dumps(hist))
+    _kv_set("discovery_run", now_utc())
+    print(f"[discovery] {summary}")
+    return summary
+
+
+def discovery_meta() -> dict:
+    conn = get_db()
+    try:
+        boards = conn.execute("SELECT COUNT(*) FROM ats_boards").fetchone()[0]
+        wd = conn.execute("SELECT COUNT(*) FROM workday_boards").fetchone()[0]
+        week = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        new7 = conn.execute("SELECT COUNT(*) FROM ats_boards WHERE added_at >= ?", (week,)).fetchone()[0]
+        disc = conn.execute("SELECT COUNT(*) FROM discovered_companies").fetchone()[0]
+        li = conn.execute("SELECT COUNT(*) FROM li_companies").fetchone()[0]
+    finally:
+        conn.close()
+    hist = json.loads(_kv_get("discovery_history") or "[]")
+    return {"boards": boards + wd, "new_7d": new7, "workday": wd, "companies_seen": disc, "li_companies": li,
+            "last_discovery": _kv_get("discovery_run"), "last": hist[-1] if hist else {}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4695,7 +4947,7 @@ a.apply-btn.board{background:#92400e;}
 </div>
 
 <script>
-let allJobs=[], allPosts=[], allStartups=[], tab='jobs';
+let allJobs=[], allPosts=[], allStartups=[], META={}, tab='jobs';
 
 const SRC_CLASS = {
   remoteok:'src-remoteok', remotive:'src-remotive', arbeitnow:'src-arbeitnow',
@@ -4806,7 +5058,10 @@ async function setStartupStatus(key,s){
   await loadStartups();
 }
 
+async function loadMeta(){ try{ META=await (await fetch('/api/meta')).json(); }catch(e){ META={}; } }
+
 async function refresh(){
+  await loadMeta();
   await Promise.all([loadJobs(), loadPosts(), loadStartups()]);
   document.getElementById('lastScan').textContent =
     'Last refreshed: '+new Date().toLocaleTimeString()+' · '+(window.__jhNote ? window.__jhNote() : 'auto-syncs with the cloud every 10 min');
@@ -4829,6 +5084,7 @@ function renderJobStats(){
   document.getElementById('jobStats').innerHTML=`
     <div class="stat"><div class="num">${nDirect}</div><div class="lbl">Direct links</div></div>
     <div class="stat"><div class="num">${nEmail}</div><div class="lbl">Apply by email</div></div>
+    <div class="stat" title="Company job boards polled for new roles; grows every day through discovery"><div class="num">${META.boards||'–'}</div><div class="lbl">Companies tracked${META.new_7d?` (+${META.new_7d} this week)`:''}</div></div>
     <div class="stat"><div class="num">${c.total}</div><div class="lbl">Total Jobs</div></div>
     <div class="stat"><div class="num">${c.new}</div><div class="lbl">New</div></div>
     <div class="stat"><div class="num">${c.saved}</div><div class="lbl">Saved</div></div>
@@ -5072,6 +5328,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json([dict(r) for r in rows])
             return
 
+        if path == "/api/meta":
+            self._json(discovery_meta())
+            return
+
         if path == "/api/startups":
             conn = get_db()
             rows = conn.execute("SELECT key, name, funded_on, data, score, status FROM startups "
@@ -5164,9 +5424,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Job Hunter v3")
     parser.add_argument("--init-db",    action="store_true")
     parser.add_argument("--scan",       action="store_true", help="Run one-off scan and exit")
-    parser.add_argument("--mode",       choices=["light", "full"], help="With --scan: light = job APIs only, full = everything")
+    parser.add_argument("--mode",       choices=["light", "full", "discovery"], help="With --scan: light = job APIs only, full = everything")
     parser.add_argument("--serve",      action="store_true", help="Start dashboard + discovery loop")
     parser.add_argument("--export-static", metavar="DIR", help="Write the encrypted static dashboard (for Vercel) to DIR and exit")
+    parser.add_argument("--discover",   action="store_true", help="Run the daily discovery step now and exit")
     parser.add_argument("--startups",   action="store_true", help="Collect + enrich funded startups and exit")
     parser.add_argument("--posts",      action="store_true", help="Pull + vet hiring posts only (LinkedIn via Apify) and exit")
     parser.add_argument("--port",       type=int, default=SERVE_PORT)
@@ -5178,6 +5439,10 @@ def main() -> None:
 
     if args.export_static:
         sys.exit(0 if export_static(args.export_static) else 1)
+
+    if args.discover:
+        run_discovery(load_rules())
+        return
 
     if args.startups:
         collect_funded_startups(load_rules())

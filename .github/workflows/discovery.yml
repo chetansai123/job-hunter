@@ -11,12 +11,13 @@ on:
   schedule:
     - cron: '3 * * * *'         # backup only: hourly light scan (GitHub's scheduler is unreliable; cron-job.org triggers every 30 min)
     - cron: '17 */3 * * *'      # full scan every 3 hours (+ LinkedIn jobs, career pages in a real browser, LinkedIn post search)  ~15 min
+    - cron: '41 21 * * *'       # daily discovery (03:11 IST): find new companies + their job boards. Full scans also run it if a day was missed.
   workflow_dispatch:
     inputs:
       mode:
         description: 'Scan mode'
         type: choice
-        options: [light, full]
+        options: [light, full, discovery]
         default: full
 
 permissions:
@@ -30,9 +31,9 @@ concurrency:
 jobs:
   discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
-      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '17 */3 * * *' && 'full' || 'light') }}
+      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '17 */3 * * *' && 'full' || (github.event.schedule == '41 21 * * *' && 'discovery' || 'light')) }}
       SCAN_INTERVAL_MINUTES: '0'
       AUTO_SYNC: '0'
       APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -62,7 +63,7 @@ jobs:
           ls -la jobs.db 2>/dev/null || true
 
       - name: Install Playwright browser (full scans only)
-        if: env.MODE == 'full'
+        if: env.MODE != 'light'
         run: |
           pip install --quiet playwright
           playwright install --with-deps chromium
