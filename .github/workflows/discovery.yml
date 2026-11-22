@@ -53,7 +53,12 @@ jobs:
 
       - name: Restore the database from the data branch
         run: |
-          git fetch --depth=1 origin data 2>/dev/null && git show origin/data:jobs.db > jobs.db || echo "no data branch yet — starting empty"
+          if git fetch --depth=1 origin data 2>/dev/null; then
+            git show origin/data:jobs.db > jobs.db                        # must succeed — never scan from an empty DB
+            [ "$(stat -c %s jobs.db)" -gt 100000 ] || { echo "restored jobs.db is suspiciously small — aborting"; exit 1; }
+          else
+            echo "no data branch yet — starting empty"
+          fi
           ls -la jobs.db 2>/dev/null || true
 
       - name: Install Playwright browser (full scans only)
@@ -69,7 +74,7 @@ jobs:
         run: python -u job_hunter.py --scan --mode "$MODE"
 
       - name: Publish database to the data branch
-        if: always()
+        if: success()
         run: |
           [ -f jobs.db ] || exit 0
           rm -rf /tmp/pub && mkdir /tmp/pub && cp jobs.db /tmp/pub/
@@ -82,8 +87,8 @@ jobs:
           git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
           echo "published $(du -h jobs.db | cut -f1)"
 
-      - name: Build the encrypted dashboard and publish it to the site branch (Vercel serves this branch)
-        if: always()
+      - name: Build the dashboard and publish it to the site branch (GitHub Pages serves it)
+        if: success()
         run: |
           [ -n "$DASH_PASSWORD" ] && pip install --quiet cryptography
           python job_hunter.py --export-static /tmp/site

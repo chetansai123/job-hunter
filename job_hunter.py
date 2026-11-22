@@ -716,6 +716,9 @@ _NEGATIVE_TITLE = [
     "customer success", "support engineer", "sales engineer", "solutions engineer",
     "power bi", "bi developer", "tableau", "etl", "data warehouse", "datawarehouse", "dwh", "qlik", "business intelligence",
     "informatica", "snowflake developer", "mainframe", "cobol", "oracle apps", "peoplesoft",
+    "liferay", "aem", "adobe experience manager", "snaplogic", "vermilion", "axiom", "kdb", "qlik", "qliksense",
+    "sharepoint", "power apps", "powerapps", "openwrt", "data engineer", "developer success", "uat", "oracle programmer",
+    "snowflake", "sitecore", "dynamics 365", "pega", "appian", "outsystems", "mulesoft", "servicenow developer",
 ]
 _SOFT_NEG = {"customer", "marketing", "growth", "content", "creative", "solutions", "implementation", "consultant", "support",
              "account", "quality", "infrastructure", "ecosystem", "technical services", "contractor", "freelance", "reviewer",
@@ -3420,7 +3423,7 @@ def site_profiles(company: str) -> dict:
 
 def build_contacts(conn: sqlite3.Connection, company: str, use_search: bool = True) -> list[dict]:
     key = company.strip().lower()
-    row = conn.execute("SELECT data, real FROM company_contacts WHERE company=?", (key,)).fetchone()
+    row = conn.execute("SELECT data, real, updated_at FROM company_contacts WHERE company=?", (key,)).fetchone()
     if row and (row["real"] or not (use_search and fc_search_available())):
         if row["real"] or (row["updated_at"] and (days_ago(row["updated_at"]) or 0) < 7):
             return json.loads(row["data"])
