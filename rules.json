@@ -744,6 +744,20 @@
       "webflow",
       "workos",
       "zapier"
+    ],
+    "keka": [
+      "comida",
+      "foxsense",
+      "impactanalytics",
+      "intangles",
+      "kenresearch",
+      "oneture",
+      "smartcoin",
+      "uffizio"
+    ],
+    "zoho": [
+      "kissflow.in",
+      "ultrahuman.in"
     ]
   },
   "sources": {

@@ -135,7 +135,7 @@ ATS_HOSTS: frozenset[str] = frozenset({
     "jobs.ashbyhq.com",
     "apply.workable.com",
     "jobs.smartrecruiters.com", "careers.smartrecruiters.com",
-    "app.bamboohr.com",
+    "app.bamboohr.com", "keka.com", "zohorecruit.in", "zohorecruit.com",
     "recruitee.com",
     "breezy.hr",
     "jobs.gem.com",
@@ -406,7 +406,12 @@ def looks_like_listing(url: str) -> bool:
         return False                                          # company-hosted Greenhouse posting
     host = _netloc(url)
     segs = [x for x in path.split("/") if x]
-    if ats_board_from_url(url):
+    ab = ats_board_from_url(url)
+    if ab:
+        if ab[0] == "zoho":
+            return len(segs) < 3                              # /jobs/Careers/<id>/<title> is the posting
+        if ab[0] == "keka":
+            return "jobdetails" not in segs
         return len(segs) < 2                                  # board root, not a posting
     if host == "apply.workable.com":
         return len(segs) < 3                                  # /slug/j/<id> is the posting
@@ -2729,6 +2734,8 @@ _ATS_PATTERNS = {
     "greenhouse": re.compile(r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/([a-z0-9_-]+)", re.I),
     "lever":      re.compile(r"jobs\.lever\.co/([a-z0-9_.-]+)", re.I),
     "ashby":      re.compile(r"jobs\.ashbyhq\.com/([a-z0-9_.%-]+)", re.I),
+    "keka":       re.compile(r"//([a-z0-9-]+)\.keka\.com/careers", re.I),
+    "zoho":       re.compile(r"//([a-z0-9-]+\.zohorecruit\.(?:in|com|eu))", re.I),
 }
 _BAD_TOKENS = {"embed", "jobs", "api", "v1", "boards"}
 
@@ -2737,7 +2744,10 @@ def ats_board_from_url(url: str) -> tuple[str, str] | None:
     for kind, rx in _ATS_PATTERNS.items():
         m = rx.search(url or "")
         if m and m.group(1).lower() not in _BAD_TOKENS:
-            return kind, m.group(1).lower()
+            tok = m.group(1).lower()
+            if kind == "zoho":
+                tok = tok.replace(".zohorecruit.", ".")            # "kissflow.zohorecruit.in" → "kissflow.in"
+            return kind, tok
     return None
 
 
@@ -2752,7 +2762,7 @@ _SUB_SLUG_DOMAINS = ("bamboohr.com", "applytojob.com", "breezy.hr", "recruitee.c
 def company_from_url(url: str) -> str:
     b = ats_board_from_url(url)
     if b:
-        return b[1].replace("-", " ").replace("_", " ").title()
+        return b[1].split(".")[0].replace("-", " ").replace("_", " ").title()
     host = _netloc(url)
     if host in _PATH_SLUG_HOSTS:
         seg = next((x for x in urllib.parse.urlparse(url).path.split("/") if x), "")
@@ -2805,7 +2815,7 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
     kind, token = board
     out: list[dict] = []
     max_days = rules.get("freshness", {}).get("max_age_days", 40)
-    company = token.replace("-", " ").replace("_", " ").title()
+    company = token.split(".")[0].replace("-", " ").replace("_", " ").title()
 
     if kind == "greenhouse":
         raw = http_get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout=25)
@@ -2835,6 +2845,14 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
             date_s = datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d") if ms else ""
             out.append(_job(company, title, url, "ats:lever", rules, location=loc, date=date_s,
                             jd_text=jd, reason=f"Lever · {token}"))
+    elif kind in ("keka", "zoho"):
+        jobs = keka_jobs(token) if kind == "keka" else zoho_jobs(token)
+        _board_failed(kind, token, jobs is None)
+        for j in jobs or []:
+            if not j["url"] or not _prefilter(j["title"], company, j["url"], j["location"], rules) or not _fresh_enough(j["date"], rules):
+                continue
+            out.append(_job(company.split(".")[0], j["title"], j["url"], f"ats:{kind}", rules, location=j["location"], date=j["date"],
+                            jd_text=(j["jd"] + (f"\nExperience: {j['exp']}" if j["exp"] else "")), reason=f"{kind.title()} · {token}"))
     elif kind == "ashby":
         raw = http_get(f"https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true", timeout=25)
         jobs = raw.get("jobs") if isinstance(raw, dict) else None
@@ -3029,6 +3047,57 @@ def _slug_candidates(company: str) -> list[str]:
     return out[:4]
 
 
+# ── Keka & Zoho Recruit (very common with Indian startups) — public job lists with the full JD ─────────
+_KEKA_GUID: dict[str, str | None] = {}
+
+
+def keka_jobs(sub: str) -> list[dict] | None:
+    """[{title, url, location, jd, exp, date}] from <sub>.keka.com, or None when it isn't a Keka customer."""
+    if sub not in _KEKA_GUID:
+        h = http_get_text(f"https://{sub}.keka.com/careers/", 15, quiet=True)
+        m = re.search(r"/ats/documents/([0-9a-f-]{36})/careerportal", h or "")
+        _KEKA_GUID[sub] = m.group(1) if m else None
+    guid = _KEKA_GUID[sub]
+    if not guid:
+        return None
+    d = http_get(f"https://{sub}.keka.com/careers/api/embedjobs/default/active/{guid}", timeout=20, quiet=True)
+    if not isinstance(d, list):
+        return None
+    out = []
+    for j in d:
+        locs = j.get("jobLocations") or []
+        loc = " / ".join(", ".join(x for x in (l.get("city"), l.get("state"), l.get("countryCode")) if x) for l in locs if isinstance(l, dict))
+        out.append({"title": j.get("title", ""), "url": f"https://{sub}.keka.com/careers/jobdetails/{j.get('id')}",
+                    "location": loc, "jd": _html_to_text(j.get("description") or ""), "exp": j.get("experience") or "",
+                    "date": (j.get("publishedOn") or "")[:10]})
+    return out
+
+
+def zoho_jobs(token: str) -> list[dict] | None:
+    """token = "<sub>.in" / "<sub>.com" (or a bare name: both domains are tried)."""
+    hosts = [f"{token.rsplit('.', 1)[0]}.zohorecruit.{token.rsplit('.', 1)[1]}"] if "." in token else \
+            [f"{token}.zohorecruit.in", f"{token}.zohorecruit.com"]
+    for host in hosts:
+        d = http_get(f"https://{host}/recruit/v2/public/Job_Openings?pagename=Careers&source=CareerSite", timeout=20, quiet=True)
+        if isinstance(d, dict) and d.get("code") == "success":
+            out = []
+            for j in d.get("data") or []:
+                if str(j.get("Publish", "True")) == "False":
+                    continue
+                loc = ", ".join(x for x in (j.get("City"), j.get("State"), j.get("Country")) if x)
+                if str(j.get("Remote_Job", "")).lower() == "true":
+                    loc = (loc + " / Remote").strip(" /")
+                try:
+                    date = datetime.strptime(j.get("Date_Opened", ""), "%m/%d/%Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    date = ""
+                out.append({"title": j.get("Posting_Title") or j.get("Job_Opening_Name", ""), "url": j.get("$url", ""),
+                            "location": loc, "jd": _html_to_text(j.get("Job_Description") or ""),
+                            "exp": str(j.get("Work_Experience") or "").replace("None", ""), "date": date})
+            return out
+    return None
+
+
 _ATS_LIST_CACHE: dict[tuple[str, str], tuple[float, list | None]] = {}
 
 
@@ -3071,6 +3140,12 @@ def _ats_postings(kind: str, slug: str) -> list[tuple[str, str, str]] | None:
             d = http_get(f"https://{slug}.breezy.hr/json", timeout=15, quiet=True)
             if isinstance(d, list) and d:
                 res = [(j.get("name", ""), j.get("url", ""), ((j.get("location") or {}).get("name") or "")) for j in d]
+        elif kind == "keka":
+            kj = keka_jobs(slug)
+            res = [(j["title"], j["url"], j["location"]) for j in kj] if kj is not None else None
+        elif kind == "zoho":
+            zj = zoho_jobs(slug)
+            res = [(j["title"], j["url"], j["location"]) for j in zj] if zj is not None else None
         elif kind == "workable":
             d = http_get(f"https://apply.workable.com/api/v1/widget/accounts/{slug}", timeout=15, quiet=True)
             if isinstance(d, dict) and "jobs" in d:
@@ -3097,7 +3172,7 @@ def resolve_direct(company: str, title: str, rules: dict | None = None) -> tuple
         return None
     want_lv = set(_LEVEL_TOKENS.findall(want))
     for slug in _slug_candidates(company):
-        for kind in ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy"):
+        for kind in ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy", "keka", "zoho"):
             posts = _ats_postings(kind, slug)
             if not posts:
                 continue
@@ -4133,7 +4208,7 @@ def _startup_roles(name: str, website: str, careers: str, rules: dict) -> dict:
     if ab:
         boards.append(ab)
     for st in dict.fromkeys(stems):
-        for kind in ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy"):
+        for kind in ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy", "keka", "zoho"):
             boards.append((kind, st))
     for kind, token in boards:
         posts = _ats_postings(kind, token)
@@ -4143,7 +4218,7 @@ def _startup_roles(name: str, website: str, careers: str, rules: dict) -> dict:
                if u and title_relevant(t) and passes_hard_filters(t, name, u, "", rules)[0] and location_ok(loc or "", rules)[0]]
         conn = get_db()
         try:
-            if kind in ("greenhouse", "lever", "ashby"):
+            if kind in ("greenhouse", "lever", "ashby", "keka", "zoho"):
                 conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, token, "funded-startup", now_utc()))
                 conn.commit()
         finally:
@@ -4197,6 +4272,10 @@ def _enrich_startup(d: dict, rules: dict) -> dict:
 def collect_funded_startups(rules: dict) -> int:
     rows = _inc42_funding_rows()
     conn = get_db()
+    if _kv_get("startups_enrich_version") != "2":          # Keka / Zoho Recruit added → re-check every startup once
+        conn.execute("UPDATE startups SET enriched_at=''")
+        conn.commit()
+        _kv_set("startups_enrich_version", "2")
     for r in rows:
         k = _skey(r["name"])
         if not k:
