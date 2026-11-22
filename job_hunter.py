@@ -3551,7 +3551,7 @@ _STATIC_SHIM = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{di
   });
   const marks=()=>JSON.parse(LS.getItem('jh_marks')||'{}');
   const json=o=>new Response(JSON.stringify(o),{headers:{'Content-Type':'application/json'}});
-  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes every few hours'):'';
+  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes about every 30 min'):'';
   window.fetch=async function(url,opts){
     const u=String(url);
     if(!u.startsWith('/api/')) return origFetch(url,opts);
@@ -3580,7 +3580,7 @@ _STATIC_SHIM_OPEN = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()
   const ready=origFetch('data.json?'+Date.now()).then(r=>r.json()).then(d=>{DATA=d;});
   const marks=()=>JSON.parse(LS.getItem('jh_marks')||'{}');
   const json=o=>new Response(JSON.stringify(o),{headers:{'Content-Type':'application/json'}});
-  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes every few hours'):'';
+  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes about every 30 min'):'';
   window.fetch=async function(url,opts){
     const u=String(url);
     if(!u.startsWith('/api/')) return origFetch(url,opts);
