@@ -2296,6 +2296,33 @@ _CONTACT_ROUTE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\bdm\b|direct message|mess
                             r"send (?:your |an? )?(?:cv|resume|profile|portfolio|application)|share (?:your )?(?:cv|resume|profile)|"
                             r"drop (?:your )?(?:cv|resume)|whatsapp|\bcomment\b|ping me|(?:call|text)\s*[:\-]?\s*\+?\d[\d ]{8,}|\+?\d[\d -]{9,}\d|"
                             r"apply (?:here|now|at|via|through|on)\b.{0,60}https?://|https?://\S*(?:apply|careers?|jobs?|forms?)\S*", re.I)
+POST_MAX_DAYS = int(os.environ.get("POST_MAX_DAYS", "30"))
+_ENTRY_TEXT = re.compile(r"\bfreshers?\b|\bfresh graduates?\b|\b0\s*(?:-|–|to)\s*(?:6\s*months?|1\s*(?:years?|yrs?)|2\s*(?:years?|yrs?))\b|"
+                         r"\b0\s*(?:-|–|to)\s*[12]\b|6\s*months?\s*(?:-|–|to)\s*1\s*(?:years?|yrs?)|"
+                         r"\b(?:0|zero)\s*(?:\+)?\s*(?:years?|yrs?)\b|\b(?:[1-9]|1[0-1])\s*months?\s*(?:of\s+)?(?:experience|exp)\b|"
+                         r"entry[- ]level|batch of 20\d\d|20\d\d (?:batch|graduates?|pass[- ]?outs?)|\bcampus (?:hire|drive)\b", re.I)
+
+
+def _exp_ranges(text: str):
+    try:
+        return [(a, b) for a, b in parse_experience(text)]
+    except Exception:
+        return []
+
+
+def _post_age_days(p: dict):
+    d = (p.get("posted_at") or "")[:10]
+    if d:
+        a = days_ago(d)
+        if a is not None:
+            return a
+    m = re.search(r"activity-(\d{16,19})|urn:li:activity:(\d{16,19})", str(p.get("post_url", "")))
+    if m:
+        ms = int(m.group(1) or m.group(2)) >> 22
+        return max(0, int((time.time() * 1000 - ms) / 86_400_000))
+    return None
+
+
 _TEMPLATE_POST = re.compile(r"apply today or share this post|share this post with your network|click (?:on )?the link below to apply$", re.I)
 
 
@@ -2314,6 +2341,14 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     head = low[:450]
     src = str(p.get("source", ""))
     role = p.get("poster_role") or ""
+    age = _post_age_days(p)
+    if age is not None and age > POST_MAX_DAYS:
+        return False, f"older than {POST_MAX_DAYS} days ({age}d) — the role is usually filled"
+    if _ENTRY_TEXT.search(low):
+        return False, "entry-level wording (fresher / 0-1 yr / months of experience)"
+    mx = _exp_ranges(text)
+    if mx and all(hi is not None and hi <= 1 for lo, hi in mx):
+        return False, "experience range tops out at 1 yr or less"
     if _TEMPLATE_POST.search(low) or re.search(r"^\s*we're #hiring a new [^\n]{3,120}\.\s*apply", low):
         return False, "auto-generated company-page job card"
     if re.search(r"welcom(?:e|ing)\b.{0,40}\b(?:to the team|to \w+ as)|joined (?:us|our team) as|\bnew (?:joiner|hire)s?\b|work anniversary|birthday", head):
@@ -2542,9 +2577,19 @@ def _search_post_urls(query: str) -> list[str]:
                                          headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=40) as r:
                 out = [x.get("url", "") for x in json.loads(r.read().decode()).get("results", [])]
-        else:                                           # keyless best effort — usually bot-blocked, harmless when it is
-            h = http_get_text("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(f"site:linkedin.com/posts {query}"), 25, quiet=True)
-            out = [urllib.parse.unquote(m) for m in re.findall(r"uddg=([^&\"]+)", h or "")]
+        else:                                           # keyless: Brave (past-month filter), then Bing, then DuckDuckGo
+            q = urllib.parse.quote(f"site:linkedin.com/posts {query}")
+            for url in (f"https://search.brave.com/search?q={q}&tf=pm&source=web",
+                        f"https://www.bing.com/search?q={q}&count=50&filters=ex1%3a%22ez5%22",
+                        f"https://html.duckduckgo.com/html/?q={q}&df=m"):
+                h = http_get_text(url, 25, quiet=True) or ""
+                found = [urllib.parse.unquote(m) for m in re.findall(r"uddg=([^&\"]+)", h)] + \
+                        re.findall(r"https://(?:[a-z]{2,3}\.)?linkedin\.com/(?:posts|feed/update)/[^\"&<>\s\\]+", h)
+                found = [u for u in found if "linkedin.com/posts/" in u or "linkedin.com/feed/update/" in u]
+                if found:
+                    out = found
+                    break
+                time.sleep(1)
     except Exception as exc:
         print(f"  [search ✗] {str(exc)[:80]}")
     return [u.split("?")[0] for u in out if "linkedin.com/posts/" in u or "linkedin.com/feed/update/" in u]
@@ -2615,6 +2660,7 @@ def collect_linkedin_search(rules: dict) -> list[dict]:
     print(f"[linkedin-search] {len(phrases)} searches → {len(urls)} new post URLs "
           f"({'Serper' if SERPER_API_KEY else 'Tavily' if TAVILY_API_KEY else 'keyless'})")
     out = []
+    urls = [u for u in urls if (_post_age_days({"post_url": u}) or 0) <= POST_MAX_DAYS]
     for u in urls[: int(os.environ.get("LI_SEARCH_FETCH", "40"))]:
         p = _li_public_post(u, rules)
         if p:
