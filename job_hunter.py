@@ -2264,7 +2264,7 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
 _HIRING_RE = re.compile(r"\b(we(?:'re| are)\s+(?:hiring|looking|expanding)|is hiring|are hiring|(?<!\w)hiring\b(?!\s+(?:round|process|manager|season))|"
                         r"vacanc|join (?:us|our team|the team)|send (?:your )?(?:cv|resume|profile)|dm me|\bopenings?\b|\bopen roles?\b|\bopen positions?\b|"
                         r"recruiting|looking for (?:a|an|talented|experienced|passionate|skilled|strong|motivated)\b)", re.I)
-_FEED_HEADLINE = re.compile(r"job (?:alerts?|updates?|portal|board|feed|vacanc)|jobs? (?:and|&) (?:career|internship)|daily jobs?|"
+_FEED_HEADLINE = re.compile(r"hiring solutions|client coordinator|consulting|helping people find|dream jobs?|job (?:alerts?|updates?|portal|board|feed|vacanc)|jobs? (?:and|&) (?:career|internship)|daily jobs?|"
                             r"placement|staffing|consultanc|manpower|recruitment (?:agency|services|firm)|opportunit(?:y|ies) (?:hub|for)|"
                             r"career guidance|freelance(?:r| platform)|hiring updates|off[- ]campus|referral (?:group|community)", re.I)
 _SEEKER_TEXT = re.compile(r"refer me|can anyone refer|my resume|available for hire|for hire\b|open to work|#opentowork|available immediately|looking for (?:my next|a new|new) (?:role|opportunit|position|job)|"
@@ -2287,7 +2287,76 @@ _NOT_HIRING = re.compile(r"open[- ]sourced|applications in just|would you ignore
 _SENIOR_HEAD = re.compile(r"\b(senior|sr\.?|staff|principal|distinguished|architect|director|head of|vp|lead)\b", re.I)
 
 
+_DEV_ROLE = re.compile(r"\b(?:react(?:\.?js)?|node(?:\.?js)?|next\.?js|mern|mean|javascript|typescript|full[\s-]?stack|front[\s-]?end|back[\s-]?end|"
+                       r"software (?:engineer|developer)|web developer|sde[\s-]?\d?|founding engineer|ui developer|developers?|engineers?)\b", re.I)
+_BAD_ROLE = re.compile(r"\b(?:manager|head of|team lead(?:er)?|tech lead|\blead\b|cto|vp|director|graduates?|b\.?tech|freshers?|trainee|apprentice|"
+                       r"angular|laravel|php|wordpress|shopify|flutter|android|ios|\.net|java(?!script)|python|golang|ruby|app developer|"
+                       r"qa\b|tester|analyst|executive|specialist)\b", re.I)
+_CONTACT_ROUTE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\bdm\b|direct message|message me|reach out|get in touch|contact (?:me|us)|"
+                            r"send (?:your |an? )?(?:cv|resume|profile|portfolio|application)|share (?:your )?(?:cv|resume|profile)|"
+                            r"drop (?:your )?(?:cv|resume)|whatsapp|\bcomment\b|ping me|(?:call|text)\s*[:\-]?\s*\+?\d[\d ]{8,}|\+?\d[\d -]{9,}\d|"
+                            r"apply (?:here|now|at|via|through|on)\b.{0,60}https?://|https?://\S*(?:apply|careers?|jobs?|forms?)\S*", re.I)
+_TEMPLATE_POST = re.compile(r"apply today or share this post|share this post with your network|click (?:on )?the link below to apply$", re.I)
+
+
 def vet_post(p: dict, rules: dict) -> tuple[bool, str]:
+    ok, why = _vet_post_base(p, rules)
+    if not ok:
+        return ok, why
+    return _vet_post_strict(p, rules)
+
+
+def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
+    """Final gate (user rule: ONLY real hiring posts by founders / recruiters / hiring managers — a named dev role
+    at 1-3 yrs, a way to contact them, and nobody reposting other people's jobs)."""
+    text = unicodedata.normalize("NFKC", p.get("post_text") or "").replace("’", "'")
+    low = text.lower()
+    head = low[:450]
+    src = str(p.get("source", ""))
+    role = p.get("poster_role") or ""
+    if _TEMPLATE_POST.search(low) or re.search(r"^\s*we're #hiring a new [^\n]{3,120}\.\s*apply", low):
+        return False, "auto-generated company-page job card"
+    if re.search(r"welcom(?:e|ing)\b.{0,40}\b(?:to the team|to \w+ as)|joined (?:us|our team) as|\bnew (?:joiner|hire)s?\b|work anniversary|birthday", head):
+        return False, "welcome / celebration post"
+    if not _DEV_ROLE.search(head):
+        return False, "no developer role named"
+    heading = re.split(r"\n\s*\n", text.strip(), 1)[0][:300].lower()
+    if _BAD_ROLE.search(heading):
+        return False, "role not a match (manager / lead / other stack)"
+    if re.search(r"part[- ]time|unpaid|volunteer|reverse engineering|deobfuscation|\bintern", head):
+        return False, "part-time / intern / not a dev job"
+    m = re.search(r"\b(manager|head of|team lead(?:er)?|angular|laravel|php|java full|python|golang|graduates?|b\.?tech|freshers?)\b", heading)
+    if m:
+        return False, f"role not a match ({m.group(1)})"
+    core = _hits(rules.get("stack", {}).get("core", []), low)
+    structured = src.startswith(("Hiring sheet", "HN", "Reddit"))
+    generic = re.search(r"full[\s-]?stack|front[\s-]?end|software (?:engineer|developer)|web developer|founding engineer", head)
+    if not core and not (structured and generic):
+        return False, "no JS/TS/React/Node/Next stack in the post"
+    if re.search(r"angular|laravel|php|python|\bjava\b|\.net|flutter|wordpress", head) and len(core) < 3:
+        return False, "other stack in the post"
+    if not structured and not _CONTACT_ROUTE.search(low):
+        return False, "no way to contact / apply (no email, DM or link)"
+    if role == "Company page" and not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+|\bdm\b|send (?:your )?(?:cv|resume)|reach out", low):
+        return False, "company page post with no contact email / DM"
+    if src in ("LinkedIn", "X/Twitter") and role and role != "Company page":
+        dev_only = not re.search(r"founder|\bceo\b|\bcto\b|owner|director|\bhr\b|recruit|talent|people|hiring|head of|\bvp\b|manager|human resources", role.lower())
+        if dev_only and not re.search(r"\b(?:we|our|my team|i am hiring|i'm hiring|referral|refer)\b", low[:500]):
+            return False, "engineer reposting someone else's job"
+        if re.search(r"helping people find|dream job|sharing tech tips|resources|job (?:seekers?|search)|career (?:coach|mentor)|linkedin (?:growth|creator)", role.lower()):
+            return False, "job-feed / career-content author"
+    if src.startswith("HN") and (re.match(r"\s*i'?m [^,\n]{2,40},", low) or "seeking work" in low or "wants to be hired" in low):
+        return False, "job-seeker post"
+    if src.startswith(("HN", "Hiring sheet")):
+        if re.search(r"\b(?:us|usa|canada|europe|eu|uk|latam|emea)\b", low[:220]) and not re.search(r"india|asia|apac|anywhere|global", low[:400]):
+            return False, "remote limited to US / Europe"
+        if not re.search(r"india|worldwide|anywhere|global|apac|asia|remote\s*\(?(?:global|any)", low[:500]) and \
+                (re.search(r",\s*[A-Z]{2}\b", text[:300]) or re.search(r"hybrid|on-?site|in[- ]office", head)):
+            return False, "on-site / hybrid outside India"
+    return True, "ok"
+
+
+def _vet_post_base(p: dict, rules: dict) -> tuple[bool, str]:
     """Same rules as jobs, applied to a hiring post: stack, seniority, experience, location, genuine hirer."""
     text = unicodedata.normalize("NFKC", p.get("post_text") or "").replace("’", "'")
     text = re.sub(r"^✉ Apply:[^\n]*\n", "", text)
@@ -4085,6 +4154,9 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _stage("re-checking stored jobs")
     try:
         revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
+        conn.commit()
+        revet_existing_posts(rules)                     # posts are re-judged with the current rules on every run
+        conn = get_db()
         conn.execute("DELETE FROM jobs WHERE link_type='board' AND status!='applied' AND IFNULL(apply_email,'')=''")
         conn.commit()
     except Exception as exc:
