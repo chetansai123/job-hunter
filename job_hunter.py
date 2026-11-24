@@ -2350,7 +2350,7 @@ _BLOCK_WORDS = re.compile(r"\b(?:rust|golang|go lang|c\+\+|c#|\.net|asp\.net|lar
                           r"php|python|java|spring|wordpress|shopify|salesforce|sap|scala|elixir|erlang|haskell|unity)\b", re.I)
 _SOFT = re.compile(r"good to have|nice to have|plus\b|familiar|advantage|bonus|preferred|optional|or\b.*\b(?:node|react|next)|\b(?:node|react|next)", re.I)
 _ONSITE = re.compile(r"face[- ]to[- ]face|walk[- ]in|local (?:candidates|applicants)|\bwfo\b|work from office|on-?site|in[- ]office|office[- ]based|"
-                     r"(?:must|should) (?:be )?(?:based|located|reside)|only .{0,25}\bbased\b|relocat", re.I)
+                     r"(?:must|should) (?:be )?(?:based|located|reside)|only .{0,25}\bbased\b|local (?:candidates|applicants)", re.I)
 _REMOTE_OK = re.compile(r"\bremote\b|work from home|\bwfh\b|hybrid|anywhere", re.I)
 _NOT_INDIA = re.compile(r"\b(?:egypt|saudi|riyadh|jeddah|uae|dubai|abu dhabi|qatar|kuwait|bahrain|oman|nigeria|philippines|pakistan|bangladesh|"
                         r"sri lanka|poland|brazil|mexico|turkey|israel|germany|france|netherlands|singapore|malaysia|australia)\b|#egypt", re.I)
@@ -2374,10 +2374,16 @@ def _post_full_text_checks(text: str, low: str, p: dict, rules: dict):
         return f"salary stated in the post is ~{lpa:.1f} LPA — below your floor"
     if _GIG.search(low):
         return "trial / contract / part-time / intern wording"
-    if _ONSITE.search(low) and not _REMOTE_OK.search(low):
-        return "on-site / face-to-face only (no remote option)"
-    if re.search(r"local (?:candidates|applicants)|surat local|only .{0,20}(?:mumbai|delhi|pune|chennai|surat)", low):
-        return "restricted to local candidates"
+    remote_ok = bool(_REMOTE_OK.search(low))
+    if not remote_ok:
+        # no remote option: only your cities are fine (face-to-face: Hyderabad)
+        in_hyd = bool(re.search(r"hyderabad|secunderabad|hitech city|gachibowli|madhapur", low))
+        in_mine = in_hyd or bool(re.search(r"\bpune\b|bangalore|bengaluru|\bchennai\b", low))
+        if re.search(r"face[- ]to[- ]face|walk[- ]in", low) and not in_hyd:
+            return "face-to-face interview outside Hyderabad"
+        places = [x for x in rules.get("locations", {}).get("india_places", []) if _has(x.lower(), low)]
+        if (_ONSITE.search(low) or places) and not in_mine:
+            return "on-site in a city outside Hyderabad / Pune / Bangalore / Chennai, no remote option"
     if _NOT_INDIA.search(low) and not re.search(r"india|bangalore|bengaluru|hyderabad|pune|mumbai|delhi|noida|gurugram|chennai", low):
         return "role is for another country"
     core_w = re.compile(r"node|react|next|typescript|javascript|mern", re.I)
@@ -2792,7 +2798,7 @@ def _li_company_page_posts(slug: str) -> tuple[list[dict] | None, int]:
 def collect_linkedin_companies(rules: dict) -> list[dict]:
     """Hiring posts that companies publish on their own LinkedIn page. The company list = every company seen hiring
     JavaScript people on LinkedIn Jobs; each full scan checks the least-recently-checked ones."""
-    per_run = int(os.environ.get("LI_COMPANIES_PER_RUN", "120"))
+    per_run = int(os.environ.get("LI_COMPANIES_PER_RUN", "300"))
     conn = get_db()
     rows = conn.execute("SELECT slug, name FROM li_companies WHERE failures < 4 ORDER BY last_checked ASC LIMIT ?", (per_run,)).fetchall()
     known = {r[0] for r in conn.execute("SELECT post_url FROM posts")}
