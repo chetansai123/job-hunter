@@ -2310,6 +2310,85 @@ def _exp_ranges(text: str):
         return []
 
 
+_MONTHLY = re.compile(r"(?:per\s*month|/\s*month|\bpm\b|monthly|a month|p\.m\.|per\s*mo\b)", re.I)
+_AMT = re.compile(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(k|lpa|lakhs?|l\b)?|\b([\d.]+)\s*(k|lpa|lakhs?)\b", re.I)
+
+
+def post_salary_lpa(text: str):
+    """Highest INR salary found in the post, in LPA. Monthly figures (₹15,000–20,000 per month, 50K, up to ₹35,000)
+    are annualised; figures with no period and under ₹10 lakh are treated as monthly."""
+    best = None
+    for line in re.split(r"\n", text):
+        if not re.search(r"salary|ctc|stipend|pay|package|compensation|₹|\brs\b|inr|\d\s*k\b|lpa|lakh", line, re.I):
+            continue
+        vals = []
+        for m in _AMT.finditer(line):
+            num = m.group(1) or m.group(3)
+            unit = (m.group(2) or m.group(4) or "").lower()
+            try:
+                v = float((num or "").replace(",", ""))
+            except ValueError:
+                continue
+            if unit in ("lpa", "l") or unit.startswith("lakh"):
+                vals.append(v)
+            elif unit == "k":
+                vals.append(v * 1000 * 12 / 1e5 if (_MONTHLY.search(line) or v < 200) else v * 1000 / 1e5)
+            elif v >= 1e6:
+                vals.append(v / 1e5)
+            elif v >= 1000:
+                vals.append(v * 12 / 1e5)            # ₹35,000 → monthly
+        # "15-20K" style range where the second number carries the K
+        for m in re.finditer(r"(\d{1,3})\s*(?:-|–|to)\s*(\d{1,3})\s*k\b", line, re.I):
+            vals.append(float(m.group(2)) * 1000 * 12 / 1e5)
+        if vals:
+            top = max(vals)
+            best = top if best is None else max(best, top)
+    return best
+
+
+_BLOCK_WORDS = re.compile(r"\b(?:rust|golang|go lang|c\+\+|c#|\.net|asp\.net|laravel|codeigniter|angular(?:js)?|django|flask|fastapi|flutter|kotlin|swift|ruby|rails|"
+                          r"php|python|java|spring|wordpress|shopify|salesforce|sap|scala|elixir|erlang|haskell|unity)\b", re.I)
+_SOFT = re.compile(r"good to have|nice to have|plus\b|familiar|advantage|bonus|preferred|optional|or\b.*\b(?:node|react|next)|\b(?:node|react|next)", re.I)
+_ONSITE = re.compile(r"face[- ]to[- ]face|walk[- ]in|local (?:candidates|applicants)|\bwfo\b|work from office|on-?site|in[- ]office|office[- ]based|"
+                     r"(?:must|should) (?:be )?(?:based|located|reside)|only .{0,25}\bbased\b|relocat", re.I)
+_REMOTE_OK = re.compile(r"\bremote\b|work from home|\bwfh\b|hybrid|anywhere", re.I)
+_NOT_INDIA = re.compile(r"\b(?:egypt|saudi|riyadh|jeddah|uae|dubai|abu dhabi|qatar|kuwait|bahrain|oman|nigeria|philippines|pakistan|bangladesh|"
+                        r"sri lanka|poland|brazil|mexico|turkey|israel|germany|france|netherlands|singapore|malaysia|australia)\b|#egypt", re.I)
+_GIG = re.compile(r"trial|contract basis|stipend|part[- ]time|unpaid|per hour|\bfreelance|internship|\bintern\b|project[- ]based|commission", re.I)
+_FIRST_PERSON_SEEKER = re.compile(r"\babout me\b|\bi had been\b|\bi was laid off\b|laid off|\bmy (?:experience|skills|resume|cv|portfolio|projects)\b|"
+                                  r"\bi(?:'m| am) (?:really |highly |currently |also )*(?:looking|urgently|proficient|seeking|available|a )|"
+                                  r"urgently looking for a job|\bany suggestions\b|exhausted|\bi have (?:built|worked|been)\b|\bhire me\b", re.I)
+_STRONG_HIRING = re.compile(r"\bwe(?:'re| are)\s+(?:hiring|looking|expanding|seeking|building)|\b(?:is|are)\s+hiring|#hiring|\bhiring\s*[:|!\-–]|now hiring|hiring alert|"
+                            r"\bopenings?\b|\bvacanc|join (?:us|our)|to join our|\bwe need\b|\bi(?:'m| am) hiring|\bhiring (?:a|an|for)\b|looking to hire|apply (?:now|here)|send (?:your |an? )?(?:cv|resume)", re.I)
+
+
+def _post_full_text_checks(text: str, low: str, p: dict, rules: dict):
+    """Reads the WHOLE post, not just the title. Returns a rejection reason or ''."""
+    first = low[:200]
+    if re.match(r"\s*(?:looking for|seeking|need|want)\b[^\n]{0,60}(?:role|job|position|opportunit)", first) or _FIRST_PERSON_SEEKER.search(low):
+        return "job-seeker post (the author is looking for a job)"
+    if not _STRONG_HIRING.search(low):
+        return "no clear 'we are hiring' statement"
+    lpa = post_salary_lpa(text)
+    if lpa is not None and lpa < rules.get("compensation", {}).get("india_min_lpa", 15):
+        return f"salary stated in the post is ~{lpa:.1f} LPA — below your floor"
+    if _GIG.search(low):
+        return "trial / contract / part-time / intern wording"
+    if _ONSITE.search(low) and not _REMOTE_OK.search(low):
+        return "on-site / face-to-face only (no remote option)"
+    if re.search(r"local (?:candidates|applicants)|surat local|only .{0,20}(?:mumbai|delhi|pune|chennai|surat)", low):
+        return "restricted to local candidates"
+    if _NOT_INDIA.search(low) and not re.search(r"india|bangalore|bengaluru|hyderabad|pune|mumbai|delhi|noida|gurugram|chennai", low):
+        return "role is for another country"
+    core_w = re.compile(r"node|react|next|typescript|javascript|mern", re.I)
+    for line in re.split(r"\n|(?<=[.!?])\s+", text):
+        if _BLOCK_WORDS.search(line) and not _SOFT.search(line) and not core_w.search(line):
+            return f"requires another stack ({_BLOCK_WORDS.search(line).group(0).lower()})"
+    if re.search(r"\b(?:us|canada|europe|uk|latam|emea)\b[^\n]{0,30}\b(?:us|canada|europe|uk|latam|emea)\b", low[:260]) and not re.search(r"india|asia|apac", low[:400]):
+        return "regions listed do not include India"
+    return ""
+
+
 def _post_age_days(p: dict):
     d = (p.get("posted_at") or "")[:10]
     if d:
@@ -2349,6 +2428,9 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     mx = _exp_ranges(text)
     if mx and all(hi is not None and hi <= 1 for lo, hi in mx):
         return False, "experience range tops out at 1 yr or less"
+    why = _post_full_text_checks(text, low, p, rules)
+    if why:
+        return False, why
     if _TEMPLATE_POST.search(low) or re.search(r"^\s*we're #hiring a new [^\n]{3,120}\.\s*apply", low):
         return False, "auto-generated company-page job card"
     if re.search(r"welcom(?:e|ing)\b.{0,40}\b(?:to the team|to \w+ as)|joined (?:us|our team) as|\bnew (?:joiner|hire)s?\b|work anniversary|birthday", head):
@@ -3821,6 +3903,16 @@ def revet_existing_jobs(rules: dict, limit: int | None = None, stale_hours: floa
     return {"checked": len(rows), "removed": removed, "updated": updated, "why": reasons}
 
 
+def purge_posts_once(conn: sqlite3.Connection, tag: str = "posts_purge_2026_11_24") -> None:
+    """User asked to wipe every stored post once so only posts passing the full-text rules come back."""
+    if conn.execute("SELECT 1 FROM kv WHERE k=?", (tag,)).fetchone():
+        return
+    n = conn.execute("DELETE FROM posts").rowcount
+    conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?,?)", (tag, now_utc()))
+    conn.commit()
+    print(f"[purge] removed all {n} stored posts (one-time clean slate)")
+
+
 def revet_existing_posts(rules: dict) -> int:
     conn = get_db()
     rows = conn.execute("SELECT * FROM posts WHERE status='new'").fetchall()
@@ -4180,6 +4272,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     post_fns = (collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
+    purge_posts_once(conn)
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
 
     if not custom_urls and (SCAN_MODE == "discovery" or (SCAN_MODE == "full" and _due("discovery_run", 23))):
