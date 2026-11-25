@@ -1030,6 +1030,8 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
         blocked.append("spring")
     b_title = _hits(blocked, t)
     b_occ = _occurrences(blocked, b)
+    _js_core = [c for c in S.get("core", []) if c not in ("python", "java", "fastapi")]
+    core_occ = _occurrences(_js_core, b) + (core_occ - _occurrences(S.get("core", []), b) if False else 0)
     if b_title and b_occ >= core_occ and not (core_title and b_occ < 2):
         return False, f"Framework outside your stack in title ('{b_title[0]}')", {}
     if not core_title and ((b_occ >= 2 and b_occ >= core_occ) or (b_occ >= 1 and core_occ == 0)):
@@ -2290,7 +2292,7 @@ _SENIOR_HEAD = re.compile(r"\b(senior|sr\.?|staff|principal|distinguished|archit
 _DEV_ROLE = re.compile(r"\b(?:react(?:\.?js)?|node(?:\.?js)?|next\.?js|mern|mean|javascript|typescript|full[\s-]?stack|front[\s-]?end|back[\s-]?end|"
                        r"software (?:engineer|developer)|web developer|sde[\s-]?\d?|founding engineer|ui developer|developers?|engineers?)\b", re.I)
 _BAD_ROLE = re.compile(r"\b(?:manager|head of|team lead(?:er)?|tech lead|\blead\b|cto|vp|director|graduates?|b\.?tech|freshers?|trainee|apprentice|"
-                       r"angular|laravel|php|wordpress|shopify|flutter|android|ios|\.net|java(?!script)|python|golang|ruby|app developer|"
+                       r"angular|laravel|php|wordpress|shopify|flutter|android|ios|\.net|golang|ruby|app developer|"
                        r"qa\b|tester|analyst|executive|specialist)\b", re.I)
 _CONTACT_ROUTE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\bdm\b|direct message|message me|reach out|get in touch|contact (?:me|us)|"
                             r"send (?:your |an? )?(?:cv|resume|profile|portfolio|application)|share (?:your )?(?:cv|resume|profile)|"
@@ -2346,8 +2348,8 @@ def post_salary_lpa(text: str):
     return best
 
 
-_BLOCK_WORDS = re.compile(r"\b(?:rust|golang|go lang|c\+\+|c#|\.net|asp\.net|laravel|codeigniter|angular(?:js)?|django|flask|fastapi|flutter|kotlin|swift|ruby|rails|"
-                          r"php|python|java|spring|wordpress|shopify|salesforce|sap|scala|elixir|erlang|haskell|unity)\b", re.I)
+_BLOCK_WORDS = re.compile(r"\b(?:rust|golang|go lang|c\+\+|c#|\.net|asp\.net|laravel|codeigniter|angular(?:js)?|django|flask|flutter|kotlin|swift|ruby|rails|"
+                          r"php|spring|hibernate|wordpress|shopify|salesforce|sap|scala|elixir|erlang|haskell|unity)\b", re.I)
 _SOFT = re.compile(r"good to have|nice to have|plus\b|familiar|advantage|bonus|preferred|optional|or\b.*\b(?:node|react|next)|\b(?:node|react|next)", re.I)
 _ONSITE = re.compile(r"face[- ]to[- ]face|walk[- ]in|local (?:candidates|applicants)|\bwfo\b|work from office|on-?site|in[- ]office|office[- ]based|"
                      r"(?:must|should) (?:be )?(?:based|located|reside)|only .{0,25}\bbased\b|local (?:candidates|applicants)", re.I)
@@ -2374,16 +2376,6 @@ def _post_full_text_checks(text: str, low: str, p: dict, rules: dict):
         return f"salary stated in the post is ~{lpa:.1f} LPA — below your floor"
     if _GIG.search(low):
         return "trial / contract / part-time / intern wording"
-    remote_ok = bool(_REMOTE_OK.search(low))
-    if not remote_ok:
-        # no remote option: only your cities are fine (face-to-face: Hyderabad)
-        in_hyd = bool(re.search(r"hyderabad|secunderabad|hitech city|gachibowli|madhapur", low))
-        in_mine = in_hyd or bool(re.search(r"\bpune\b|bangalore|bengaluru|\bchennai\b", low))
-        if re.search(r"face[- ]to[- ]face|walk[- ]in", low) and not in_hyd:
-            return "face-to-face interview outside Hyderabad"
-        places = [x for x in rules.get("locations", {}).get("india_places", []) if _has(x.lower(), low)]
-        if (_ONSITE.search(low) or places) and not in_mine:
-            return "on-site in a city outside Hyderabad / Pune / Bangalore / Chennai, no remote option"
     if _NOT_INDIA.search(low) and not re.search(r"india|bangalore|bengaluru|hyderabad|pune|mumbai|delhi|noida|gurugram|chennai", low):
         return "role is for another country"
     core_w = re.compile(r"node|react|next|typescript|javascript|mern", re.I)
@@ -2446,11 +2438,13 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     if not _DEV_ROLE.search(head):
         return False, "no developer role named"
     heading = re.split(r"\n\s*\n", text.strip(), 1)[0][:300].lower()
+    if re.search(r"\b(?:sde|swe|software (?:development )?engineer|engineer|developer)\s*[-–]?\s*(?:3|iii|4|iv|5)\b|\bl[4-6]\b|\bsde[\s-]?(?:3|iii)\b", heading):
+        return False, "senior-level (level III+)"
     if _BAD_ROLE.search(heading):
         return False, "role not a match (manager / lead / other stack)"
     if re.search(r"part[- ]time|unpaid|volunteer|reverse engineering|deobfuscation|\bintern", head):
         return False, "part-time / intern / not a dev job"
-    m = re.search(r"\b(manager|head of|team lead(?:er)?|angular|laravel|php|java full|python|golang|graduates?|b\.?tech|freshers?)\b", heading)
+    m = re.search(r"\b(manager|head of|team lead(?:er)?|angular|laravel|php|golang|graduates?|b\.?tech|freshers?)\b", heading)
     if m:
         return False, f"role not a match ({m.group(1)})"
     core = _hits(rules.get("stack", {}).get("core", []), low)
@@ -2458,7 +2452,7 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     generic = re.search(r"full[\s-]?stack|front[\s-]?end|software (?:engineer|developer)|web developer|founding engineer", head)
     if not core and not (structured and generic):
         return False, "no JS/TS/React/Node/Next stack in the post"
-    if re.search(r"angular|laravel|php|python|\bjava\b|\.net|flutter|wordpress", head) and len(core) < 3:
+    if re.search(r"angular|laravel|php|\.net|flutter|wordpress", head) and len(core) < 3:
         return False, "other stack in the post"
     if not structured and not _CONTACT_ROUTE.search(low):
         return False, "no way to contact / apply (no email, DM or link)"
@@ -2519,7 +2513,7 @@ def _vet_post_base(p: dict, rules: dict) -> tuple[bool, str]:
     blocked = list(S.get("blocked", []))
     if re.search(r"\bjava\b", low) and re.search(r"\bspring\b", low):
         blocked.append("spring")
-    b_occ, c_occ = _occurrences(blocked, low), _occurrences(S.get("core", []), low)
+    b_occ, c_occ = _occurrences(blocked, low), _occurrences([c for c in S.get("core", []) if c not in ("python", "java", "fastapi")], low)
     if b_occ and b_occ >= max(c_occ, 1):
         return False, "stack outside yours (" + ", ".join(_hits(blocked, low)[:2]) + ")"
     generic = re.search(r"\b(software|full[\s-]?stack|front[\s-]?end|back[\s-]?end|web|application|product) (?:engineer|developer)|"
@@ -4057,7 +4051,7 @@ def export_static(outdir: str) -> bool:
     jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")]
     posts = [dict(r) for r in conn.execute("SELECT * FROM posts ORDER BY id DESC")]
     startups = [{**json.loads(r["data"]), "key": r["key"], "score": r["score"]} for r in conn.execute(
-        "SELECT key, data, score FROM startups WHERE funded_on >= ? ORDER BY score DESC, funded_on DESC",
+        "SELECT key, data, score FROM startups WHERE funded_on >= ? OR funded_on = '' ORDER BY score DESC, funded_on DESC LIMIT 6000",
         ((datetime.now() - timedelta(days=183)).strftime("%Y-%m-%d"),))]
     last = conn.execute("SELECT finished_at FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
@@ -4553,7 +4547,7 @@ def collect_funded_startups(rules: dict) -> int:
                          (k, r["name"], r["funded_on"], json.dumps(r), now_utc()))
     conn.commit()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    todo = conn.execute("SELECT key, data FROM startups WHERE enriched_at='' OR enriched_at < ? ORDER BY (enriched_at='') DESC, funded_on DESC LIMIT ?",
+    todo = conn.execute("SELECT key, data FROM startups WHERE (enriched_at='' OR enriched_at < ?) AND funded_on != '' ORDER BY (enriched_at='') DESC, funded_on DESC LIMIT ?",
                         (cutoff, STARTUP_ENRICH_PER_RUN)).fetchall()
     conn.close()
 
@@ -4583,7 +4577,7 @@ def collect_funded_startups(rules: dict) -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 TR_BASE = "https://techreferrals.in"
 _TR_TITLE_OUT = re.compile(r"\b(?:senior|sr\.?|staff|principal|lead|architect|manager|head|director|vp|intern(?:ship)?|trainee|fresher|"
-                           r"data scientist|devops|sre|qa|test|ios|android|flutter|java|python|\.net|golang|php|salesforce|sap|mainframe|"
+                           r"data scientist|devops|sre|qa|test|ios|android|flutter|\.net|golang|php|salesforce|sap|mainframe|"
                            r"security|network|embedded|hardware|designer|analyst|support|sales|marketing|recruiter)\b", re.I)
 _TR_FOUNDERS = ("harshit-jain", "akshita-kejriwal")
 
@@ -4706,7 +4700,7 @@ def collect_techreferrals(rules: dict) -> list[dict]:
 #  Sources: YC directory (companies hiring India/remote), remote-company list (remoteintech), funding news,
 #  every company seen on LinkedIn Jobs, and weekly a Common Crawl sweep of ATS hostnames.
 # ═══════════════════════════════════════════════════════════════════════════
-DISCOVERY_PER_DAY = int(os.environ.get("DISCOVERY_COMPANIES_PER_DAY", "400"))
+DISCOVERY_PER_DAY = int(os.environ.get("DISCOVERY_COMPANIES_PER_DAY", "1500"))
 
 
 def _disc_add(conn: sqlite3.Connection, name: str, website: str, source: str, info: dict | None = None) -> bool:
@@ -4719,14 +4713,18 @@ def _disc_add(conn: sqlite3.Connection, name: str, website: str, source: str, in
 
 
 def _discover_yc() -> list[tuple[str, str, dict]]:
+    """Every Y Combinator company that is hiring (any country), queried batch by batch."""
     h = http_get_text("https://www.ycombinator.com/companies", 25, quiet=True)
     m = re.search(r"window\.AlgoliaOpts\s*=\s*(\{.*?\});", h or "")
     if not m:
         return []
     o = json.loads(m.group(1))
     out = []
-    for flt in ('isHiring:true AND regions:"India"', 'isHiring:true AND regions:"Remote"', 'isHiring:true AND regions:"Asia"'):
-        for page in range(0, 12):
+    seen_slugs: set = set()
+    batches = [f"{season} {year}" for year in range(2026, 2004, -1) for season in ("Winter", "Spring", "Summer", "Fall")]
+    for batch in batches + [None]:
+        flt = f'isHiring:true AND batch:"{batch}"' if batch else "isHiring:true"
+        for page in range(0, 10):
             body = json.dumps({"requests": [{"indexName": "YCCompany_production",
                                              "params": f"hitsPerPage=100&page={page}&filters={urllib.parse.quote(flt)}"}]}).encode()
             try:
@@ -4738,11 +4736,24 @@ def _discover_yc() -> list[tuple[str, str, dict]]:
             except Exception:
                 break
             for hit in res.get("hits", []):
+                sl = hit.get("slug", "")
+                if sl in seen_slugs:
+                    continue
+                seen_slugs.add(sl)
                 out.append((hit.get("name", ""), hit.get("website", ""),
                             {"yc": hit.get("batch", ""), "locations": hit.get("all_locations", ""), "team": hit.get("team_size", ""),
-                             "about": hit.get("one_liner", ""), "yc_url": f"https://www.ycombinator.com/companies/{hit.get('slug', '')}"}))
+                             "about": hit.get("one_liner", ""), "yc_url": f"https://www.ycombinator.com/companies/{sl}"}))
             if page >= res.get("nbPages", 1) - 1:
                 break
+    return out
+
+
+def _discover_layoffsandhires() -> list[tuple[str, str, dict]]:
+    """Company names with open jobs on their own career sites (layoffsandhires.com sitemap — public, allowed by robots.txt)."""
+    x = http_get_text("https://layoffsandhires.com/sitemaps/sitemap/companies-0.xml", 30, quiet=True) or ""
+    out = []
+    for slug in re.findall(r"/jobs/at/([a-z0-9-]+)</loc>", x):
+        out.append((slug.replace("-", " ").title(), "", {"lh_slug": slug}))
     return out
 
 
@@ -4841,12 +4852,101 @@ def _register_detected(conn: sqlite3.Connection, board: str, source: str) -> Non
     # workable / recruitee / smartrecruiters are used for link resolution only (no bulk poller yet)
 
 
+_SIMPLE_ATS = ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy", "keka", "zoho")
+
+
+def _startup_from_board(name: str, website: str, source: str, info: dict, board: str, rules: dict) -> dict | None:
+    """A startup row for the Startups tab: only when its own job board lists a developer role that fits you.
+    Location: India / remote / worldwide / unstated roles stay; roles locked to another country are dropped."""
+    kind, _, token = board.partition(":")
+    posts = _ats_postings(kind, token)
+    if not posts:
+        return None
+    sen = re.compile(r"\b(?:senior|sr\.?|staff|principal|lead|architect|manager|head|director|vp|intern(?:ship)?|trainee|iii|iv|sde[\s-]?3|data scientist|"
+                     r"devops|sre|qa|ios|android|designer|analyst|support|sales|marketing|recruiter)\b", re.I)
+    dev = []
+    for t, u, loc in posts:
+        if not (u and title_relevant(t)) or sen.search(t):
+            continue
+        if not re.search(r"engineer|developer|sde|programmer|full[\s-]?stack|front[\s-]?end|back[\s-]?end|software", t, re.I):
+            continue
+        ok_loc = bool(location_ok(loc or "", rules)[0])
+        dev.append({"title": t, "url": u, "location": loc, "remote_or_india": ok_loc})
+    if not dev:
+        return None
+    dev.sort(key=lambda r: not r["remote_or_india"])
+    team = info.get("team")
+    try:
+        team = int(team) if team not in (None, "") else 0
+    except (TypeError, ValueError):
+        team = 0
+    d = {"name": name, "website": website, "source": source, "description": info.get("about", ""), "round": info.get("yc", ""),
+         "hq": info.get("locations", ""), "funded_on": "", "tech": True, "yc_url": info.get("yc_url", ""),
+         "size": {"count": team, "range": ""} if team else {}, "roles": {"board": board, "total": len(posts), "dev": dev[:8]},
+         "emails": [], "profiles": [], "founders": [], "founder_links": [], "hiring_posts": []}
+    d["recruiter_search"] = "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(f"{name} recruiter OR talent acquisition OR HR")
+    d["any_remote"] = any(r["remote_or_india"] for r in dev)
+    d["score"] = _startup_score(d) + (1 if d["any_remote"] else 0)
+    d["score"] = min(d["score"], 10)
+    return d
+
+
+def _enrich_discovered(d: dict) -> dict:
+    """Founders (+ LinkedIn) from the YC page, hiring e-mails / team profiles from the company site."""
+    if d.get("yc_url"):
+        h = http_get_text(d["yc_url"], 25, quiet=True) or ""
+        m = re.search(r'data-page="([^"]+)"', h)
+        if m:
+            try:
+                c = json.loads(htmllib.unescape(m.group(1)))["props"]["company"]
+                d["founder_links"] = [{"name": f.get("full_name", ""), "url": f.get("linkedin_url") or "", "role": f.get("title", ""),
+                                       "search": "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(f"{f.get('full_name', '')} {d['name']}")}
+                                      for f in (c.get("founders") or []) if f.get("full_name")]
+                d["founders"] = [f["name"] for f in d["founder_links"]]
+                d["description"] = d.get("description") or c.get("one_liner", "")
+                if c.get("team_size") and not d.get("size"):
+                    d["size"] = {"count": int(c["team_size"]), "range": ""}
+                d["company_linkedin"] = c.get("linkedin_url", "")
+            except Exception:
+                pass
+    if d.get("website"):
+        d.update(_site_contacts(d["website"], d.get("founders", [])))
+    d["score"] = _startup_score(d)
+    return d
+
+
+def enrich_discovered_startups(limit: int = 150) -> int:
+    conn = get_db()
+    rows = conn.execute("SELECT key, data FROM startups WHERE enriched_at='' AND funded_on='' ORDER BY score DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+
+    def work(r):
+        try:
+            return r["key"], _enrich_discovered(json.loads(r["data"]))
+        except Exception as exc:
+            print(f"  [enrich ✗] {r['key']}: {exc}")
+            return r["key"], None
+
+    with ThreadPoolExecutor(6) as ex:
+        res = list(ex.map(work, rows))
+    conn = get_db()
+    for k, d in res:
+        if d:
+            conn.execute("UPDATE startups SET data=?, score=?, enriched_at=? WHERE key=?", (json.dumps(d), d["score"], now_utc(), k))
+        else:
+            conn.execute("UPDATE startups SET enriched_at=? WHERE key=?", (now_utc(), k))
+    conn.commit()
+    conn.close()
+    return len(res)
+
+
 def run_discovery(rules: dict) -> dict:
     t0 = time.time()
     conn = get_db()
     before_boards = conn.execute("SELECT COUNT(*) FROM ats_boards").fetchone()[0] + conn.execute("SELECT COUNT(*) FROM workday_boards").fetchone()[0]
     added: dict[str, int] = {}
-    for src, fn in (("yc", _discover_yc), ("remoteintech", _discover_remoteintech), ("news", _discover_news)):
+    for src, fn in (("yc", _discover_yc), ("remoteintech", _discover_remoteintech), ("news", _discover_news),
+                    ("layoffsandhires", _discover_layoffsandhires)):
         try:
             rows = fn()
         except Exception as exc:
@@ -4872,22 +4972,37 @@ def run_discovery(rules: dict) -> dict:
         if urls:
             _kv_set("discovery_commoncrawl", now_utc())
     todo = conn.execute("""SELECT key, name, website, source, info FROM discovered_companies WHERE status='new'
-                           ORDER BY CASE source WHEN 'yc' THEN 0 WHEN 'remoteintech' THEN 1 WHEN 'news' THEN 2 ELSE 3 END, first_seen
+                           ORDER BY CASE source WHEN 'yc' THEN 0 WHEN 'remoteintech' THEN 1 WHEN 'news' THEN 2 WHEN 'linkedin' THEN 3 ELSE 4 END, first_seen
                            LIMIT ?""", (DISCOVERY_PER_DAY,)).fetchall()
     conn.close()
 
     def work(r):
         try:
             info = json.loads(r["info"] or "{}")
-            return r["key"], r["source"], detect_board(r["name"], r["website"], info.get("careers", ""))
+            board = detect_board(r["name"], r["website"], info.get("careers", ""))
+            su = None
+            if board and r["source"] in ("yc", "remoteintech", "news", "linkedin", "layoffsandhires") and board.split(":")[0] in _SIMPLE_ATS:
+                su = _startup_from_board(r["name"], r["website"], r["source"], info, board, rules)
+            return r["key"], r["source"], board, su
         except Exception:
-            return r["key"], r["source"], ""
+            return r["key"], r["source"], "", None
 
-    with ThreadPoolExecutor(12) as ex:
+    with ThreadPoolExecutor(14) as ex:
         results = list(ex.map(work, todo))
     conn = get_db()
     found = 0
-    for key, src, board in results:
+    new_startups = 0
+    for key, src, board, su in results:
+        if su:
+            sk = _skey(su["name"])
+            if sk and not conn.execute("SELECT 1 FROM startups WHERE key=?", (sk,)).fetchone():
+                conn.execute("INSERT INTO startups (key, name, funded_on, data, score, enriched_at, created_at) VALUES (?,?,?,?,?,?,?)",
+                             (sk, su["name"], "", json.dumps(su), su.get("score", 0), "", now_utc()))
+                new_startups += 1
+            elif sk:
+                old = json.loads(conn.execute("SELECT data FROM startups WHERE key=?", (sk,)).fetchone()["data"])
+                old["roles"] = su["roles"]
+                conn.execute("UPDATE startups SET data=?, score=? WHERE key=?", (json.dumps(old), _startup_score(old), sk))
         if board:
             _register_detected(conn, board, f"discovery:{src}")
             found += 1
@@ -4899,10 +5014,15 @@ def run_discovery(rules: dict) -> dict:
     conn.close()
     summary = {"date": now_utc()[:10], "new_companies": added, "checked": len(todo), "boards_found": found,
                "boards_added": after_boards - before_boards, "boards_total": after_boards, "pending": pending,
+               "startups_added": new_startups,
                "minutes": round((time.time() - t0) / 60, 1)}
     hist = json.loads(_kv_get("discovery_history") or "[]")[-29:] + [summary]
     _kv_set("discovery_history", json.dumps(hist))
     _kv_set("discovery_run", now_utc())
+    try:
+        summary["startups_enriched"] = enrich_discovered_startups(int(os.environ.get("STARTUP_ENRICH_DISCOVERED", "200")))
+    except Exception as exc:
+        print(f"  [!] startup enrichment failed: {exc}")
     print(f"[discovery] {summary}")
     return summary
 
@@ -5211,6 +5331,7 @@ a.apply-btn.board{background:#92400e;}
       <option value="saved">Saved</option>
       <option value="applied">Applied</option>
       <option value="rejected">Rejected</option>
+      <option value="deleted">Deleted</option>
     </select>
     <select id="catFilter" onchange="renderJobs()">
       <option value="all">All Roles</option>
@@ -5289,6 +5410,7 @@ a.apply-btn.board{background:#92400e;}
       <option value="any">Roles or hiring posts</option>
     </select>
     <select id="sAge" onchange="renderStartups()">
+      <option value="99999" selected>All startups (worldwide)</option>
       <option value="183">Funded in last 6 months</option>
       <option value="90">Last 3 months</option>
       <option value="30">Last 30 days</option>
@@ -5374,14 +5496,15 @@ function renderStartups(){
   });
   const withDev=allStartups.filter(s=>(s.roles&&s.roles.dev||[]).length).length;
   document.getElementById('stStats').innerHTML=`
-    <div class="stat"><div class="num">${allStartups.length}</div><div class="lbl">Funded (6 months)</div></div>
+    <div class="stat"><div class="num">${allStartups.length}</div><div class="lbl">Startups</div></div>
     <div class="stat"><div class="num">${withDev}</div><div class="lbl">With open dev roles</div></div>
     <div class="stat"><div class="num">${allStartups.filter(s=>(s.hiring_posts||[]).length).length}</div><div class="lbl">Posted hiring on LinkedIn</div></div>
     <div class="stat"><div class="num">${f.length}</div><div class="lbl">Shown</div></div>`;
   const el=document.getElementById('startups');
   if(!f.length){ el.innerHTML='<div class="post"><div class="sub">No startups match — they are enriched a batch at a time, more appear after each full scan.</div></div>'; return; }
   const link=(u,t)=>u?`<a class="view-btn" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`:'';
-  el.innerHTML=f.slice(0,300).map(s=>{
+  const stPage=pageSlice('startups',f,[q,tech,hire,age,st].join('|'));
+  el.innerHTML=pagerHtml('startups',f.length,'renderStartups')+stPage.map(s=>{
     const dev=(s.roles&&s.roles.dev)||[];
     const founders=(s.founder_links||[]).map(x=> x.url ? `<a href="${esc(x.url)}" target="_blank">${esc(x.name)} (LinkedIn)</a>` : `${esc(x.name)} <a href="${esc(x.search)}" target="_blank" style="opacity:.7">(search)</a>`).join(' · ');
     const team=(s.profiles||[]).filter(p=>p.role!=='Founder').slice(0,4).map(p=>`<a href="${esc(p.url)}" target="_blank">${esc(p.name||'profile')}</a>`).join(' · ');
@@ -5391,8 +5514,8 @@ function renderStartups(){
     <div><div class="post-name">${esc(s.name)}</div>
       <div class="sub">${esc([s.sector,s.subsector,s.model].filter(Boolean).join(' · '))}${s.hq?' · 📍 '+esc(s.hq):''}${s.founded?' · since '+esc(s.founded):''}</div></div>
     <div class="badges"><span class="badge score">⭐ ${s.score||0}/10</span>
-      <span class="badge direct">💰 ${esc(s.amount||'undisclosed')} ${esc(s.round||'')}</span>
-      <span class="badge">📅 ${esc(s.funded_on||'')}</span>${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}</div>
+      ${s.funded_on?`<span class="badge direct">💰 ${esc(s.amount||'undisclosed')} ${esc(s.round||'')}</span><span class="badge">📅 ${esc(s.funded_on)}</span>`
+                   :`<span class="badge direct">${s.source==='yc'?'🟧 YC '+esc(s.round||''):esc(s.source||'startup')}</span>`}${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}</div>
   </div>
   ${s.description?`<div class="reason">${esc(s.description.slice(0,260))}</div>`:''}
   <div class="meta">${s.investors?`<span>🏦 ${esc(s.investors)}</span>`:''}</div>
@@ -5411,7 +5534,7 @@ function renderStartups(){
     <button class="warn" onclick="setStartupStatus('${esc(s.key)}','saved')">★ Save</button>
     <button class="bad"  onclick="setStartupStatus('${esc(s.key)}','rejected')">✗ Hide</button>
   </div>
-</div>`;}).join('');
+</div>`;}).join('')+pagerHtml('startups',f.length,'renderStartups');
 }
 async function setStartupStatus(key,s){
   await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:key,status:s,type:'startup'})});
@@ -5462,6 +5585,21 @@ function renderPostStats(){
 }
 
 function esc(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+const PAGE_SIZE=20, PG={jobs:1,posts:1,startups:1}, PSIG={};
+function pageSlice(key,arr,sig){
+  if(PSIG[key]!==sig){ PSIG[key]=sig; PG[key]=1; }
+  const pages=Math.max(1,Math.ceil(arr.length/PAGE_SIZE)); if(PG[key]>pages) PG[key]=pages;
+  return arr.slice((PG[key]-1)*PAGE_SIZE, PG[key]*PAGE_SIZE);
+}
+function pagerHtml(key,total,fn){
+  const pages=Math.max(1,Math.ceil(total/PAGE_SIZE)); if(pages<=1) return '';
+  const p=PG[key];
+  return `<div style="display:flex;gap:10px;align-items:center;justify-content:center;margin:12px 0">
+    <button class="sec" ${p<=1?'disabled':''} onclick="goPage('${key}',-1,'${fn}')">← Prev</button>
+    <span style="font-size:13px">Page ${p} of ${pages} · ${total} results</span>
+    <button class="sec" ${p>=pages?'disabled':''} onclick="goPage('${key}',1,'${fn}')">Next →</button></div>`;
+}
+function goPage(key,d,fn){ PG[key]+=d; window[fn](); window.scrollTo({top:0,behavior:'smooth'}); }
 function statusBadge(s){ return `<span class="badge s${s[0]}">${esc(s.toUpperCase())}</span>`; }
 
 function renderJobs(){
@@ -5473,6 +5611,7 @@ function renderJobs(){
   const lk  = document.getElementById('linkFilter').value;
 
   const f = allJobs.filter(j=>{
+    if(j.status==='deleted' && st!=='deleted') return false;
     if(st!=='all' && j.status!==st) return false;
     if(cat!=='all' && j.role_category!==cat) return false;
     if(src!=='all' && !j.discovery_source.toLowerCase().includes(src)) return false;
@@ -5488,7 +5627,8 @@ function renderJobs(){
   const el=document.getElementById('jobs');
   if(!f.length){ el.innerHTML='<div class="job"><div class="sub">No jobs match current filter.</div></div>'; return; }
 
-  el.innerHTML=f.map(j=>`
+  const jobsPage=pageSlice('jobs',f,[q,st,cat,src,minScore,lk].join('|'));
+  el.innerHTML=pagerHtml('jobs',f.length,'renderJobs')+jobsPage.map(j=>`
 <div class="job">
   <div class="jt">
     <div>
@@ -5528,8 +5668,9 @@ function renderJobs(){
     <button class="ok"   onclick="setJobStatus(${j.id},'applied')">✓ Applied</button>
     <button class="warn" onclick="setJobStatus(${j.id},'saved')">★ Save</button>
     <button class="bad"  onclick="setJobStatus(${j.id},'rejected')">✗ Reject</button>
+    <button class="sec"  onclick="setJobStatus(${j.id},'deleted')" title="Remove from the dashboard">🗑 Delete</button>
   </div>
-</div>`).join('');
+</div>`).join('')+pagerHtml('jobs',f.length,'renderJobs');
 }
 
 function renderPosts(){
@@ -5538,6 +5679,7 @@ function renderPosts(){
   const st  = document.getElementById('pStFilter').value;
 
   const f = allPosts.filter(p=>{
+    if(p.status==='deleted' && st!=='deleted') return false;
     if(st!=='all' && p.status!==st) return false;
     if(src!=='all' && !p.source.includes(src)) return false;
     if(q){
@@ -5550,7 +5692,8 @@ function renderPosts(){
   const el=document.getElementById('posts');
   if(!f.length){ el.innerHTML='<div class="post"><div class="sub">No posts match current filter.</div></div>'; return; }
 
-  el.innerHTML=f.map(p=>`
+  const postsPage=pageSlice('posts',f,[q,src,st].join('|'));
+  el.innerHTML=pagerHtml('posts',f.length,'renderPosts')+postsPage.map(p=>`
 <div class="post">
   <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;">
     <div class="post-src">${esc(p.source)}${p.posted_at?' · '+esc(p.posted_at):''}</div>
@@ -5567,8 +5710,9 @@ function renderPosts(){
     <button class="ok"   onclick="setPStatus(${p.id},'contacted')" style="font-size:12px">✉ Contacted</button>
     <button class="warn" onclick="setPStatus(${p.id},'saved')"     style="font-size:12px">★ Save</button>
     <button class="sec"  onclick="document.getElementById('pb${p.id}').classList.toggle('exp')" style="font-size:12px">▼ More</button>
+    <button class="sec"  onclick="setPStatus(${p.id},'deleted')" style="font-size:12px">🗑 Delete</button>
   </div>
-</div>`).join('');
+</div>`).join('')+pagerHtml('posts',f.length,'renderPosts');
 }
 
 async function setJobStatus(id,s){
@@ -5695,7 +5839,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/startups":
             conn = get_db()
             rows = conn.execute("SELECT key, name, funded_on, data, score, status FROM startups "
-                                "WHERE funded_on >= ? ORDER BY score DESC, funded_on DESC",
+                                "WHERE funded_on >= ? OR funded_on = '' ORDER BY score DESC, funded_on DESC LIMIT 6000",
                                 ((datetime.now() - timedelta(days=183)).strftime("%Y-%m-%d"),)).fetchall()
             conn.close()
             self._json([{**json.loads(r["data"]), "key": r["key"], "score": r["score"], "status": r["status"]} for r in rows])
@@ -5742,7 +5886,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length).decode() or "{}")
 
         if self.path == "/api/status":
-            if payload.get("status") not in ("new", "saved", "applied", "rejected", "contacted"):
+            if payload.get("status") not in ("new", "saved", "applied", "rejected", "contacted", "deleted"):
                 self._json({"error": "bad status"}, 400)
                 return
             conn = get_db()
