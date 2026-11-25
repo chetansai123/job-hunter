@@ -2437,6 +2437,8 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     why = _post_full_text_checks(text, low, p, rules)
     if why:
         return False, why
+    if re.search(r"teamware|\bstaffing\b|\bconsultancy\b|manpower|talent solutions|hr solutions|recruitment", (p.get("_tr_org") or "") + " " + (p.get("poster_role") or ""), re.I):
+        return False, "staffing / recruitment agency"
     if _TEMPLATE_POST.search(low) or re.search(r"^\s*we're #hiring a new [^\n]{3,120}\.\s*apply", low):
         return False, "auto-generated company-page job card"
     if re.search(r"welcom(?:e|ing)\b.{0,40}\b(?:to the team|to \w+ as)|joined (?:us|our team) as|\bnew (?:joiner|hire)s?\b|work anniversary|birthday", head):
@@ -2769,6 +2771,9 @@ def _li_register_company(slug: str, name: str = "") -> None:
         conn.close()
 
 
+_LI_SIZE: dict = {}
+
+
 def _li_company_page_posts(slug: str) -> tuple[list[dict] | None, int]:
     u = f"https://www.linkedin.com/company/{slug}/posts/"
     try:
@@ -2780,6 +2785,10 @@ def _li_company_page_posts(slug: str) -> tuple[list[dict] | None, int]:
     except Exception:
         return None, 0
     out = []
+    sm = re.search(r'numberOfEmployees"\s*:\s*\{[^}]*?"value"\s*:\s*(\d+)', body)
+    rng = re.search(r'([\d,]+(?:-[\d,]+)?\+?) employees', body)
+    if sm or rng:
+        _LI_SIZE[slug] = {"count": int(sm.group(1)) if sm else 0, "range": ([x for x in re.findall(r'([\d,]+-[\d,]+\+?|[\d,]+\+) employees', body)] or [""])[0]}
     for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', body, re.S):
         try:
             d = json.loads(m.group(1))
@@ -4275,7 +4284,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
 
     # 5. posts (founders / recruiters / TA — never staffing feeds) --------------
     _stage("collecting hiring posts")
-    post_fns = (collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
+    post_fns = (collect_techreferrals, collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     purge_posts_once(conn)
@@ -4484,6 +4493,10 @@ def _startup_score(d: dict) -> int:
     d["tech"] = bool(_TECH_SECTORS.search(f"{d.get('sector', '')} {d.get('subsector', '')} {d.get('description', '')[:200]}"))
     sc += 2 if d["tech"] else 0
     sc += 1 if re.search(r"seed|series a|series b|pre-series", d.get("round", ""), re.I) else 0
+    n = (d.get("size") or {}).get("count") or 0
+    d["small"] = bool(n and n <= 50)
+    d["tiny"] = bool(n and n < 30)
+    sc += 2 if d["tiny"] else 1 if d["small"] else 0
     return min(sc, 10)
 
 
@@ -4501,6 +4514,8 @@ def _enrich_startup(d: dict, rules: dict) -> dict:
     if d.get("li_slug"):
         _li_register_company(d["li_slug"], d["name"])
         posts, _code = _li_company_page_posts(d["li_slug"])
+        if d["li_slug"] in _LI_SIZE:
+            d["size"] = _LI_SIZE[d["li_slug"]]
         for p in posts or []:
             if _HIRING_RE.search(p["text"][:600]) and re.search(r"engineer|developer|sde|full[\s-]?stack|front[\s-]?end|back[\s-]?end", p["text"], re.I):
                 d["hiring_posts"].append({"url": p["post_url"], "date": p["date"], "text": p["text"][:280]})
@@ -4560,6 +4575,130 @@ def collect_funded_startups(rules: dict) -> int:
     conn.close()
     print(f"[startups] enriched {sum(1 for _, d in results if d)} · {total} funded startups (last 6 months) in the list")
     return total
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TECHREFERRALS.IN  — hiring posts by real employees / recruiters / founders (LinkedIn + X), with the poster's
+#  profile and/or e-mail. Public pages (robots.txt allows them; /api/ and /go/ are never touched).
+# ═══════════════════════════════════════════════════════════════════════════
+TR_BASE = "https://techreferrals.in"
+_TR_TITLE_OUT = re.compile(r"\b(?:senior|sr\.?|staff|principal|lead|architect|manager|head|director|vp|intern(?:ship)?|trainee|fresher|"
+                           r"data scientist|devops|sre|qa|test|ios|android|flutter|java|python|\.net|golang|php|salesforce|sap|mainframe|"
+                           r"security|network|embedded|hardware|designer|analyst|support|sales|marketing|recruiter)\b", re.I)
+_TR_FOUNDERS = ("harshit-jain", "akshita-kejriwal")
+
+
+def _tr_get(path: str) -> str:
+    time.sleep(0.5)
+    return http_get_text(TR_BASE + path, 25, quiet=True) or ""
+
+
+def _tr_list(category: str, pages: int, seen: set) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for pg in range(1, pages + 1):
+        h = _tr_get(f"/?category={urllib.parse.quote_plus(category)}&page={pg}")
+        found = re.findall(r'"url":"https://techreferrals\.in/p/([0-9a-f-]{36})","name":"([^"]+)"', h)
+        if not found:
+            break
+        fresh = [(i, n) for i, n in found if i not in seen]
+        out.extend(fresh)
+        if not fresh and pg > 1:                 # everything on this page was already handled → older pages are too
+            break
+    return out
+
+
+def _tr_post(pid: str, name: str, rules: dict) -> dict | None:
+    h = _tr_get(f"/p/{pid}")
+    if not h:
+        return None
+    node = None
+    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', h, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except ValueError:
+            continue
+        for n in (d.get("@graph") if isinstance(d, dict) and "@graph" in d else [d]):
+            if isinstance(n, dict) and n.get("@type") in ("JobPosting", "SocialMediaPosting"):
+                node = n
+    if not node:
+        return None
+    page = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(r"<script.*?</script>|<style.*?</style>", "", h, flags=re.S)))
+    seg = page[page.find("Posted by"):] if "Posted by" in page else ""
+    seg = seg.split("Open original post")[0].split("Check it’s real")[0]
+    glance = re.search(r"At a glance (.*?)(?:Posted \d|Total Experience|Looking for|Check it|How to reach out)", page)
+    reach = re.search(r"How to reach out:\s*(.{10,400}?)(?:\s{2,}|Open original post|Contributed by| [A-Z][\w.+#]+(?: [A-Z][\w.+#]+){0,2} [A-Z][\w.+#]+ [A-Z][\w.+#]+ )", page)
+    desc = _html_to_text(htmllib.unescape(node.get("description", "") or ""))
+    org = ((node.get("hiringOrganization") or node.get("about") or {}) or {}).get("name", "")
+    headline = node.get("headline") or node.get("title") or name
+    au = node.get("author") or {}
+    poster_name = htmllib.unescape(au.get("name") or "").strip()
+    prof = (au.get("url") or "").strip()
+    if not prof:
+        links = re.findall(r'href="(https://www\.linkedin\.com/in/[^"]+)"', h)
+        prof = next((u for u in links if not any(f in u for f in _TR_FOUNDERS)), "")
+    if not poster_name:
+        wm = re.search(r"Who posted this opening\s+\S\s+(.+?)\s+Posted by", page)
+        poster_name = wm.group(1).strip() if wm else ""
+    if not poster_name:
+        pm = re.search(r"Posted by (?:an? )?(.{3,60}?) (?:Verified|at |Human|Talent|Recruit|HR|Founder|Co-?founder|CEO|CTO|Engineering|Senior|Software)", page)
+        poster_name = pm.group(1).strip() if pm else ""
+    role = ""
+    if "Who posted this opening" in page and not au.get("name"):
+        rm = re.search(r"Posted by (an? [^.]{3,50}?) (?:Verified|Hiring contact|Email|$)", page[page.find("Who posted this opening"):])
+        role = (rm.group(1) if rm else "employee")
+    elif poster_name and poster_name in seg:
+        role = seg.split(poster_name, 1)[1].strip()[:70]
+        role = re.split(r"\s{1,}(?:%s|is hiring|are hiring|At a glance)" % re.escape(org or "@@"), role)[0].strip()
+    skills = node.get("keywords") or ""
+    emails = [e for e in re.findall(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", (reach.group(1) if reach else "") + " " + desc + " " + seg)
+              if not e.lower().endswith(("techreferrals.in", ".png", ".webp"))]
+    orig = node.get("isBasedOn") or next(iter(re.findall(r'href="(https://www\.linkedin\.com/feed/update/[^"]+)"', h)), "")
+    parts = [f"{headline}.", desc]
+    if glance:
+        parts.append("At a glance: " + glance.group(1).replace("Experience ", "Experience: ").replace("Pay ", "Pay: ").replace("Where ", "Location: ").strip())
+    if poster_name:
+        parts.append(f"Posted by {poster_name}" + (f", {role}" if role else "") + ".")
+    reach_txt = (reach.group(1).strip() if reach else "")
+    if reach_txt:
+        parts.append("How to reach out: " + reach_txt)
+    if emails and not any(e in reach_txt for e in emails):
+        parts.append(f"Email: {emails[0]}")
+    if prof:
+        parts.append(f"Reach out to {poster_name or 'the poster'} on LinkedIn: {prof}")
+    if skills:
+        parts.append("Skills: " + skills)
+    text = "\n".join(x for x in parts if x)
+    mloc = re.search(r"Location: ([^\n]+?)(?: Looking for|$)", text)
+    role = htmllib.unescape(role)
+    return {"source": "TechReferrals", "poster_name": poster_name or org, "poster_role": role or "Employee",
+            "poster_url": prof, "post_url": orig or f"{TR_BASE}/p/{pid}", "post_text": text[:3500],
+            "skills_found": _extract_skills(text, rules), "location": (mloc.group(1) if mloc else "")[:60],
+            "posted_at": (node.get("datePublished") or node.get("datePosted") or "")[:10],
+            "_headline": None, "_tr_org": org, "_tr_id": pid}
+
+
+def collect_techreferrals(rules: dict) -> list[dict]:
+    try:
+        seen = set(json.loads(_kv_get("tr_seen") or "[]"))
+    except ValueError:
+        seen = set()
+    pages = int(os.environ.get("TR_PAGES", "40")) if not seen else int(os.environ.get("TR_PAGES_DAILY", "6"))
+    cands = []
+    for cat in ("Software Engineering",):
+        cands.extend(_tr_list(cat, pages, seen))
+    keep = [(i, n) for i, n in cands if not _TR_TITLE_OUT.search(n.split(" at ")[0])]
+    print(f"[techreferrals] {len(cands)} new posts listed → {len(keep)} after the title filter")
+    cap = int(os.environ.get("TR_DETAIL_CAP", "400"))
+    out: list[dict] = []
+    with ThreadPoolExecutor(2) as ex:
+        for p in ex.map(lambda x: _tr_post(x[0], x[1], rules), keep[:cap]):
+            if p:
+                out.append(p)
+    done = {i for i, _ in keep[:cap]}
+    seen.update(i for i, _ in cands if i in done or (i, _) not in keep)
+    _kv_set("tr_seen", json.dumps(sorted(seen)[-6000:]))
+    print(f"[techreferrals] {len(out)} readable posts")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5140,6 +5279,8 @@ a.apply-btn.board{background:#92400e;}
     <input type="text" id="sq" placeholder="Search startup, sector, investor, city…" oninput="renderStartups()"/>
     <select id="sTech" onchange="renderStartups()">
       <option value="tech" selected>Tech startups</option>
+      <option value="tiny">👥 Tiny: under 30 people</option>
+      <option value="small">👥 Small: 50 people or fewer</option>
       <option value="all">All sectors</option>
     </select>
     <select id="sHiring" onchange="renderStartups()">
@@ -5221,6 +5362,8 @@ function renderStartups(){
         hire=document.getElementById('sHiring').value, age=+document.getElementById('sAge').value, st=document.getElementById('sStFilter').value;
   const f=allStartups.filter(s=>{
     if(tech==='tech' && s.tech===false) return false;
+    if(tech==='tiny' && !s.tiny) return false;
+    if(tech==='small' && !s.small) return false;
     if(daysSince(s.funded_on)>age) return false;
     if(st!=='all' && (s.status||'new')!==st) return false;
     const dev=(s.roles&&s.roles.dev||[]).length;
@@ -5249,7 +5392,7 @@ function renderStartups(){
       <div class="sub">${esc([s.sector,s.subsector,s.model].filter(Boolean).join(' · '))}${s.hq?' · 📍 '+esc(s.hq):''}${s.founded?' · since '+esc(s.founded):''}</div></div>
     <div class="badges"><span class="badge score">⭐ ${s.score||0}/10</span>
       <span class="badge direct">💰 ${esc(s.amount||'undisclosed')} ${esc(s.round||'')}</span>
-      <span class="badge">📅 ${esc(s.funded_on||'')}</span>${statusBadge(s.status||'new')}</div>
+      <span class="badge">📅 ${esc(s.funded_on||'')}</span>${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}</div>
   </div>
   ${s.description?`<div class="reason">${esc(s.description.slice(0,260))}</div>`:''}
   <div class="meta">${s.investors?`<span>🏦 ${esc(s.investors)}</span>`:''}</div>
