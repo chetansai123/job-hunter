@@ -4210,6 +4210,13 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             continue
         j["_nu"] = nu
         fresh.append(j)
+    try:
+        for j in candidates:
+            if not str(j.get("discovery_source", "")).startswith("ats:") and j.get("company") and len(j["company"]) > 2:
+                _disc_add(conn, j["company"], "", "jobboards", {})
+        conn.commit()
+    except Exception as exc:
+        print(f"  [!] job-board companies not recorded: {exc}")
     fresh = _interleave(fresh)
     if len(fresh) > MAX_VERIFY_PER_SCAN:
         print(f"[verify] capping {len(fresh)} → {MAX_VERIFY_PER_SCAN} this scan (rest next scan)")
@@ -4610,8 +4617,6 @@ def _tr_list(category: str, pages: int, seen: set) -> list[tuple[str, str]]:
             break
         fresh = [(i, n) for i, n in found if i not in seen]
         out.extend(fresh)
-        if not fresh and pg > 1:                 # everything on this page was already handled → older pages are too
-            break
     return out
 
 
@@ -4717,7 +4722,7 @@ def collect_techreferrals(rules: dict) -> list[dict]:
 #  Sources: YC directory (companies hiring India/remote), remote-company list (remoteintech), funding news,
 #  every company seen on LinkedIn Jobs, and weekly a Common Crawl sweep of ATS hostnames.
 # ═══════════════════════════════════════════════════════════════════════════
-DISCOVERY_PER_DAY = int(os.environ.get("DISCOVERY_COMPANIES_PER_DAY", "1500"))
+DISCOVERY_PER_DAY = int(os.environ.get("DISCOVERY_COMPANIES_PER_DAY", "3000"))
 
 
 def _disc_add(conn: sqlite3.Connection, name: str, website: str, source: str, info: dict | None = None) -> bool:
@@ -4762,6 +4767,51 @@ def _discover_yc() -> list[tuple[str, str, dict]]:
                              "about": hit.get("one_liner", ""), "yc_url": f"https://www.ycombinator.com/companies/{sl}"}))
             if page >= res.get("nbPages", 1) - 1:
                 break
+    return out
+
+
+def _discover_hn() -> list[tuple[str, str, dict]]:
+    """Companies from the last 3 monthly 'Who is hiring?' threads — real, currently hiring startups."""
+    top = http_get("https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12", timeout=20)
+    threads = [h for h in (top.get("hits", []) if isinstance(top, dict) else []) if "who is hiring" in (h.get("title") or "").lower()][:3]
+    out, seen = [], set()
+    for th in threads:
+        tid = th.get("objectID", "")
+        for page in range(0, 8):
+            data = http_get(f"https://hn.algolia.com/api/v1/search_by_date?tags=comment,story_{tid}&hitsPerPage=500&page={page}", timeout=30)
+            hits = data.get("hits", []) if isinstance(data, dict) else []
+            for c in hits:
+                if str(c.get("parent_id")) != str(tid):
+                    continue
+                raw = c.get("comment_text", "") or ""
+                text = _hn_text(raw)
+                first = text.split("\n")[0]
+                name = re.split(r"\s*[|(\u2013\u2014]\s*", first)[0].strip(" .:-")[:60]
+                if not name or len(name) < 2 or name.lower() in seen or len(name.split()) > 5 or \
+                        re.search(r"seeking|freelance|early[- ]stage|stealth|hiring|startup\b|remote$|full[- ]?time|\bwanted\b", name, re.I):
+                    continue
+                seen.add(name.lower())
+                url = next((u for u in re.findall(r'href="(https?://[^"]+)"', raw) if "ycombinator" not in u and "linkedin" not in u), "")
+                out.append((name, url, {"about": first[:160], "hn": True}))
+            if len(hits) < 500:
+                break
+    return out
+
+
+def _discover_lists() -> list[tuple[str, str, dict]]:
+    """Curated public company lists on GitHub (README tables / bullet lists)."""
+    out = []
+    for url in ("https://raw.githubusercontent.com/poteto/hiring-without-whiteboards/master/README.md",
+                "https://raw.githubusercontent.com/yanirs/established-remote/master/README.md",
+                "https://raw.githubusercontent.com/lukasz-madon/awesome-remote-job/master/README.md"):
+        md = http_get_text(url, 30, quiet=True) or ""
+        for name, link in re.findall(r"\[([^\]]{2,50})\]\((https?://[^)\s]+)\)", md):
+            pu = urllib.parse.urlparse(link)
+            if any(x in link for x in ("github.com", "twitter.com", "linkedin.com", "medium.com", "youtube.com", "wikipedia", "ycombinator.com",
+                                       "archive.org", "reddit.com", "notion.", "docs.google")) or \
+                    len([p for p in pu.path.split("/") if p]) > 2 or re.search(r"\d{4}|how[- ]|hire|interview|blog|guide", name + pu.path, re.I):
+                continue
+            out.append((name.strip(), link, {"list": url.split("/")[4]}))
     return out
 
 
@@ -4963,7 +5013,7 @@ def run_discovery(rules: dict) -> dict:
     before_boards = conn.execute("SELECT COUNT(*) FROM ats_boards").fetchone()[0] + conn.execute("SELECT COUNT(*) FROM workday_boards").fetchone()[0]
     added: dict[str, int] = {}
     for src, fn in (("yc", _discover_yc), ("remoteintech", _discover_remoteintech), ("news", _discover_news),
-                    ("layoffsandhires", _discover_layoffsandhires)):
+                    ("hn", _discover_hn), ("lists", _discover_lists), ("layoffsandhires", _discover_layoffsandhires)):
         try:
             rows = fn()
         except Exception as exc:
@@ -4989,7 +5039,7 @@ def run_discovery(rules: dict) -> dict:
         if urls:
             _kv_set("discovery_commoncrawl", now_utc())
     todo = conn.execute("""SELECT key, name, website, source, info FROM discovered_companies WHERE status='new'
-                           ORDER BY CASE source WHEN 'yc' THEN 0 WHEN 'remoteintech' THEN 1 WHEN 'news' THEN 2 WHEN 'linkedin' THEN 3 ELSE 4 END, first_seen
+                           ORDER BY CASE source WHEN 'yc' THEN 0 WHEN 'remoteintech' THEN 1 WHEN 'hn' THEN 2 WHEN 'news' THEN 3 WHEN 'jobboards' THEN 4 WHEN 'lists' THEN 5 WHEN 'linkedin' THEN 6 ELSE 7 END, first_seen
                            LIMIT ?""", (DISCOVERY_PER_DAY,)).fetchall()
     conn.close()
 
@@ -4998,7 +5048,7 @@ def run_discovery(rules: dict) -> dict:
             info = json.loads(r["info"] or "{}")
             board = detect_board(r["name"], r["website"], info.get("careers", ""))
             su = None
-            if board and r["source"] in ("yc", "remoteintech", "news", "linkedin", "layoffsandhires") and board.split(":")[0] in _SIMPLE_ATS:
+            if board and r["source"] in ("yc", "remoteintech", "news", "linkedin", "layoffsandhires", "hn", "lists", "jobboards") and board.split(":")[0] in _SIMPLE_ATS:
                 su = _startup_from_board(r["name"], r["website"], r["source"], info, board, rules)
             return r["key"], r["source"], board, su
         except Exception:
