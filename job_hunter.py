@@ -4305,6 +4305,16 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.commit()
         revet_existing_posts(rules)                     # posts are re-judged with the current rules on every run
         conn = get_db()
+        cut = 0
+        for r in conn.execute("SELECT id, experience_req FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
+            st = parse_experience(r["experience_req"] or "")
+            if st and min(x[0] for x in st) > rules.get("experience", {}).get("max_min_years", 3):
+                conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+                cut += 1
+        conn.commit()
+        conn.close()
+        print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit")
+        conn = get_db()
         conn.execute("DELETE FROM jobs WHERE link_type='board' AND status!='applied' AND IFNULL(apply_email,'')=''")
         conn.commit()
     except Exception as exc:

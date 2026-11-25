@@ -124,8 +124,8 @@
     "_blocked_note": "Updated 2026-11-25: Python + FastAPI + plain Java (no Spring Boot required) are YOURS now. Spring/Hibernate/J2EE, .NET, PHP, Django, Ruby, Kotlin, C++ etc. stay blocked."
   },
   "experience": {
-    "_note": "Candidate has ~2.2 yrs. A JD qualifies when its MINIMUM is <= 3 (so 1-3, 2-4, 3-8 all pass; 4+, 5-8 fail). Entry-level / fresher-only posts are rejected. Updated 2026-11-25: a minimum of 4 is tolerated (candidate has 2+ yrs and wants interviews).",
-    "max_min_years": 4,
+    "_note": "Candidate has ~2.3 yrs (2.7 with internship). A JD qualifies when its MINIMUM is <= 3 ('3+' is fine). A minimum of 4 or 4+ is REJECTED. Entry-level / fresher-only posts are rejected.",
+    "max_min_years": 3,
     "reject_title_keywords": [
       "senior",
       "sr.",
