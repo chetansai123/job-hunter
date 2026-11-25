@@ -4307,8 +4307,8 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn = get_db()
         cut = 0
         for r in conn.execute("SELECT id, experience_req FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
-            st = parse_experience(r["experience_req"] or "")
-            if st and min(x[0] for x in st) > rules.get("experience", {}).get("max_min_years", 3):
+            mm = re.match(r"\s*(\d+)", r["experience_req"] or "")
+            if mm and int(mm.group(1)) > rules.get("experience", {}).get("max_min_years", 3):
                 conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
                 cut += 1
         conn.commit()
