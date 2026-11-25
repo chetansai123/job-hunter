@@ -3984,14 +3984,18 @@ _STATIC_SHIM = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{di
     const u=String(url);
     if(!u.startsWith('/api/')) return origFetch(url,opts);
     await ready; const m=marks();
-    if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
+    if(u==='/api/jobs'){ const del=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+      return json(DATA.jobs.map(j=>({...j,status:del.has(j.direct_apply_url)?'deleted':(m['j'+j.job_hash]||'new')}))); }
     if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
     if(u==='/api/startups') return json((DATA.startups||[]).map(s=>({...s,status:m['s'+s.key]||'new'})));
     if(u==='/api/meta') return json(DATA.meta.discovery||{});
     if(u==='/api/status'){ const b=JSON.parse(opts.body);
       if(b.type==='startup'){ m['s'+b.id]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); return json({ok:true}); }
       const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
-      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); } return json({ok:true}); }
+      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m));
+        if(b.type!=='post'){ const d=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+          if(b.status==='deleted') d.add(row.direct_apply_url); else d.delete(row.direct_apply_url);
+          LS.setItem('jh_deleted_urls',JSON.stringify([...d])); } } return json({ok:true}); }
     if(u==='/api/stats') return json({total_jobs:DATA.jobs.length,last_scan:{finished_at:DATA.meta.generated_at},scan:{running:false}});
     if(u==='/api/scan-status') return json({running:false,stage:''});
     return json({ok:true,started:false});
@@ -4017,14 +4021,18 @@ _STATIC_SHIM_OPEN = r"""<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()
     const u=String(url);
     if(!u.startsWith('/api/')) return origFetch(url,opts);
     await ready; const m=marks();
-    if(u==='/api/jobs') return json(DATA.jobs.map(j=>({...j,status:m['j'+j.job_hash]||'new'})));
+    if(u==='/api/jobs'){ const del=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+      return json(DATA.jobs.map(j=>({...j,status:del.has(j.direct_apply_url)?'deleted':(m['j'+j.job_hash]||'new')}))); }
     if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
     if(u==='/api/startups') return json((DATA.startups||[]).map(s=>({...s,status:m['s'+s.key]||'new'})));
     if(u==='/api/meta') return json(DATA.meta.discovery||{});
     if(u==='/api/status'){ const b=JSON.parse(opts.body);
       if(b.type==='startup'){ m['s'+b.id]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); return json({ok:true}); }
       const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
-      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); } return json({ok:true}); }
+      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m));
+        if(b.type!=='post'){ const d=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+          if(b.status==='deleted') d.add(row.direct_apply_url); else d.delete(row.direct_apply_url);
+          LS.setItem('jh_deleted_urls',JSON.stringify([...d])); } } return json({ok:true}); }
     if(u==='/api/stats') return json({total_jobs:DATA.jobs.length,last_scan:{finished_at:DATA.meta.generated_at},scan:{running:false}});
     if(u==='/api/scan-status') return json({running:false,stage:''});
     return json({ok:true,started:false});
@@ -5964,6 +5972,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE posts SET status=? WHERE id=?",
                              (payload["status"], int(payload["id"])))
             else:
+                if payload["status"] == "deleted":
+                    r = conn.execute("SELECT direct_apply_url FROM jobs WHERE id=?", (int(payload["id"]),)).fetchone()
+                    if r:
+                        conn.execute("INSERT OR IGNORE INTO seen_jobs (url, first_seen) VALUES (?,?)", (norm_url(r["direct_apply_url"]), now_utc()))
                 conn.execute("UPDATE jobs SET status=? WHERE id=?",
                              (payload["status"], int(payload["id"])))
             conn.commit(); conn.close()
