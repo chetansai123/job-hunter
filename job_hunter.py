@@ -4152,6 +4152,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _SCRAPE_BUDGET["left"] = int(os.environ.get("SCRAPE_BUDGET", "80"))
     rules = load_rules()
     conn = get_db()
+    if _kv_get("rules_version") != "2026-11-25-py-java":    # stack / experience rules changed → re-judge URLs rejected under the old rules
+        conn.execute("DELETE FROM rejected_urls")
+        conn.commit()
+        _kv_set("rules_version", "2026-11-25-py-java")
     cur = conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (now_utc(),))
     run_id = cur.lastrowid
     conn.commit()
@@ -4682,6 +4686,9 @@ def _tr_post(pid: str, name: str, rules: dict) -> dict | None:
 
 
 def collect_techreferrals(rules: dict) -> list[dict]:
+    if _kv_get("tr_version") != "3":                 # filters changed → look at every TechReferrals post again
+        _kv_set("tr_seen", "[]")
+        _kv_set("tr_version", "3")
     try:
         seen = set(json.loads(_kv_get("tr_seen") or "[]"))
     except ValueError:
