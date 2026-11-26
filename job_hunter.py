@@ -3327,6 +3327,31 @@ def zoho_jobs(token: str) -> list[dict] | None:
 _ATS_LIST_CACHE: dict[tuple[str, str], tuple[float, list | None]] = {}
 
 
+_ATS_DATES: dict = {}
+
+
+def _remember_dates(kind: str, items) -> None:
+    for j in items or []:
+        try:
+            if kind == "greenhouse":
+                u, d = j.get("absolute_url", ""), (j.get("first_published") or j.get("updated_at") or "")[:10]
+            elif kind == "lever":
+                u, ms = j.get("hostedUrl", ""), j.get("createdAt")
+                d = datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d") if ms else ""
+            elif kind == "ashby":
+                u, d = j.get("jobUrl") or j.get("applyUrl", ""), (j.get("publishedAt") or "")[:10]
+            elif kind == "recruitee":
+                u, d = j.get("careers_url", ""), (j.get("published_at") or j.get("created_at") or "")[:10]
+            elif kind == "workable":
+                u, d = j.get("url") or j.get("shortlink", ""), (j.get("published_on") or j.get("created_at") or "")[:10]
+            else:
+                continue
+            if u and d:
+                _ATS_DATES[u] = d
+        except Exception:
+            continue
+
+
 def _ats_postings(kind: str, slug: str) -> list[tuple[str, str, str]] | None:
     """[(title, url, location)] for a public ATS board, or None when the board doesn't exist (cached 1h / 10min)."""
     key = (kind, slug)
@@ -3338,19 +3363,23 @@ def _ats_postings(kind: str, slug: str) -> list[tuple[str, str, str]] | None:
         if kind == "greenhouse":
             d = http_get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs", timeout=15, quiet=True)
             if isinstance(d, dict) and "jobs" in d:
+                _remember_dates("greenhouse", d["jobs"])
                 res = [(j.get("title", ""), j.get("absolute_url", ""), (j.get("location") or {}).get("name", "")) for j in d["jobs"]]
         elif kind == "lever":
             d = http_get(f"https://api.lever.co/v0/postings/{slug}?mode=json", timeout=15, quiet=True)
             if isinstance(d, list):
+                _remember_dates("lever", d)
                 res = [(j.get("text", ""), j.get("hostedUrl", ""), (j.get("categories") or {}).get("location", "") or "") for j in d]
         elif kind == "ashby":
             d = http_get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", timeout=15, quiet=True)
             if isinstance(d, dict) and "jobs" in d:
+                _remember_dates("ashby", d["jobs"])
                 res = [(j.get("title", ""), j.get("jobUrl") or j.get("applyUrl", ""),
                         (j.get("location", "") or "") + (" / Remote" if j.get("isRemote") else "")) for j in d["jobs"]]
         elif kind == "recruitee":
             d = http_get(f"https://{slug}.recruitee.com/api/offers/", timeout=15, quiet=True)
             if isinstance(d, dict) and "offers" in d:
+                _remember_dates("recruitee", d["offers"])
                 res = [(j.get("title", ""), j.get("careers_url", ""), j.get("location", "") or "") for j in d["offers"]]
         elif kind == "smartrecruiters":
             d = http_get(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit=100", timeout=15, quiet=True)
@@ -3375,6 +3404,7 @@ def _ats_postings(kind: str, slug: str) -> list[tuple[str, str, str]] | None:
         elif kind == "workable":
             d = http_get(f"https://apply.workable.com/api/v1/widget/accounts/{slug}", timeout=15, quiet=True)
             if isinstance(d, dict) and "jobs" in d:
+                _remember_dates("workable", d["jobs"])
                 res = [(j.get("title", ""), j.get("url") or j.get("shortlink", ""), j.get("city", "") + " " + j.get("country", "")) for j in d["jobs"]]
     except Exception:
         res = None
@@ -4059,8 +4089,8 @@ def export_static(outdir: str) -> bool:
     jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")]
     posts = [dict(r) for r in conn.execute("SELECT * FROM posts ORDER BY id DESC")]
     startups = [{**json.loads(r["data"]), "key": r["key"], "score": r["score"]} for r in conn.execute(
-        "SELECT key, data, score FROM startups WHERE funded_on >= ? OR funded_on = '' ORDER BY score DESC, funded_on DESC LIMIT 6000",
-        ((datetime.now() - timedelta(days=183)).strftime("%Y-%m-%d"),))]
+        "SELECT key, data, score, funded_on FROM startups ORDER BY score DESC, funded_on DESC LIMIT 8000")
+        if startup_visible(json.loads(r["data"]), r["funded_on"])]
     last = conn.execute("SELECT finished_at FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     meta = {"generated_at": now_utc(), "last_scan": (last["finished_at"] if last else ""), "jobs": len(jobs), "posts": len(posts),
@@ -4268,6 +4298,19 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             except Exception:
                 pass
     _stage(f"saving {len(accepted)} jobs")
+    if SERPER_API_KEY or TAVILY_API_KEY:
+        keep = []
+        for job in accepted:
+            india = not re.search(r"remote|worldwide|anywhere", job.get("location", "") or "", re.I) or "india" in (job.get("location", "") or "").lower()
+            if india and not job.get("salary"):
+                est = company_sde_salary(job["company"])
+                if est is not None and est < SALARY_FLOOR_EST:
+                    rejects[f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})"] = rejects.get(f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})", 0) + 1
+                    continue
+                if est is not None:
+                    job["notes"] = (job.get("notes", "") + f" Typical SDE pay at {job['company']}: ~{est} LPA (from search results).").strip()
+            keep.append(job)
+        accepted = keep
     for job in accepted:
         try:
             company_contacts = build_contacts(conn, job["company"], use_search=contact_searches < 12)
@@ -4301,6 +4344,12 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     purge_posts_once(conn)
+    if _kv_get("startups_revalidated") != "v1":
+        try:
+            revalidate_startups(rules)
+            _kv_set("startups_revalidated", "v1")
+        except Exception as exc:
+            print(f"  [!] startup re-validation failed: {exc}")
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
 
     if not custom_urls and (SCAN_MODE == "discovery" or (SCAN_MODE == "full" and _due("discovery_run", 23))):
@@ -4333,6 +4382,23 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.commit()
         conn.close()
         print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit")
+        if SERPER_API_KEY or TAVILY_API_KEY:                  # stored India jobs with no stated pay: check the company
+            conn = get_db()
+            low_pay = 0
+            for r in conn.execute("SELECT id, company, location, notes FROM jobs WHERE status NOT IN ('applied','saved') "
+                                  "AND IFNULL(salary,'')='' AND IFNULL(notes,'') NOT LIKE '%Typical SDE pay%' LIMIT 60").fetchall():
+                loc = (r["location"] or "").lower()
+                if re.search(r"remote|worldwide|anywhere", loc) and "india" not in loc:
+                    continue
+                est = company_sde_salary(r["company"])
+                if est is not None and est < SALARY_FLOOR_EST:
+                    conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+                    low_pay += 1
+                elif est is not None:
+                    conn.execute("UPDATE jobs SET notes=? WHERE id=?", (((r["notes"] or "") + f" Typical SDE pay at {r['company']}: ~{est} LPA.").strip(), r["id"]))
+            conn.commit()
+            conn.close()
+            print(f"[pay] removed {low_pay} stored jobs at companies paying under {SALARY_FLOOR_EST:g} LPA")
         conn = get_db()
         conn.execute("DELETE FROM jobs WHERE link_type='board' AND status!='applied' AND IFNULL(apply_email,'')=''")
         conn.commit()
@@ -4490,11 +4556,15 @@ def _startup_roles(name: str, website: str, careers: str, rules: dict) -> dict:
         for kind in ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters", "bamboohr", "breezy", "keka", "zoho"):
             boards.append((kind, st))
     for kind, token in boards:
+        if not board_belongs(name, website, f"{kind}:{token}"):
+            continue
         posts = _ats_postings(kind, token)
         if not posts:
             continue
-        dev = [{"title": t, "url": u, "location": loc} for t, u, loc in posts
-               if u and title_relevant(t) and passes_hard_filters(t, name, u, "", rules)[0] and location_ok(loc or "", rules)[0]]
+        dev = [{"title": t, "url": u, "location": loc, "posted": _ATS_DATES.get(u, "")} for t, u, loc in posts
+               if u and title_relevant(t) and passes_hard_filters(t, name, u, "", rules)[0]
+               and not re.search(r"analyst|\btest\b|qa\b|sdet|support|sales|designer", t, re.I)
+               and not (_ATS_DATES.get(u) and (days_ago(_ATS_DATES[u]) or 0) > 183)]
         conn = get_db()
         try:
             if kind in ("greenhouse", "lever", "ashby", "keka", "zoho"):
@@ -4890,11 +4960,30 @@ def _discover_commoncrawl() -> list[str]:
     return urls
 
 
+_VC_BOARD = re.compile(r"vc$|-vc\b|ventures?|capital|partners|portfolio|talent|network|accelerator|collective|fund\b|labs-jobs|combinator", re.I)
+
+
+def board_belongs(name: str, website: str, board: str) -> bool:
+    """True when the ATS token is the company's own (e.g. 'acme' for Acme Inc / acme.io) — not a VC portfolio board."""
+    kind, _, tok = (board or "").partition(":")
+    if kind == "workday":
+        return True
+    t = re.sub(r"[^a-z0-9]", "", tok.lower())
+    if not t or _VC_BOARD.search(tok):
+        return False
+    stems = {re.sub(r"[^a-z0-9]", "", x.lower()) for x in _slug_candidates(name)}
+    if website:
+        dom = _netloc(website if website.startswith("http") else "https://" + website).split(".")
+        stems.add(re.sub(r"[^a-z0-9]", "", dom[0] if dom[0] not in ("www", "app") else (dom[1] if len(dom) > 1 else "")))
+    stems = {x for x in stems if len(x) >= 3}
+    return any(t == x or t.startswith(x) or x.startswith(t) and len(t) >= 4 for x in stems)
+
+
 def detect_board(name: str, website: str, careers: str = "") -> str:
     """'kind:token' / 'workday:host|tenant|site' for the company's job board, or '' — careers link first, then name slugs."""
     for u in [careers] if careers else []:
         ab, wb = ats_board_from_url(u), workday_board_from_url(u)
-        if ab:
+        if ab and board_belongs(name, website, f"{ab[0]}:{ab[1]}"):
             return f"{ab[0]}:{ab[1]}"
         if wb:
             return "workday:" + "|".join(wb)
@@ -4905,7 +4994,7 @@ def detect_board(name: str, website: str, careers: str = "") -> str:
             for href in re.findall(r'href="([^"#]+)"', h or ""):
                 u = urllib.parse.urljoin(base + path, htmllib.unescape(href))
                 ab, wb = ats_board_from_url(u), workday_board_from_url(u)
-                if ab:
+                if ab and board_belongs(name, website, f"{ab[0]}:{ab[1]}"):
                     return f"{ab[0]}:{ab[1]}"
                 if wb:
                     return "workday:" + "|".join(wb)
@@ -4933,6 +5022,8 @@ _SIMPLE_ATS = ("greenhouse", "lever", "ashby", "workable", "recruitee", "smartre
 def _startup_from_board(name: str, website: str, source: str, info: dict, board: str, rules: dict) -> dict | None:
     """A startup row for the Startups tab: only when its own job board lists a developer role that fits you.
     Location: India / remote / worldwide / unstated roles stay; roles locked to another country are dropped."""
+    if not board_belongs(name, website, board):
+        return None
     kind, _, token = board.partition(":")
     posts = _ats_postings(kind, token)
     if not posts:
@@ -4943,10 +5034,13 @@ def _startup_from_board(name: str, website: str, source: str, info: dict, board:
     for t, u, loc in posts:
         if not (u and title_relevant(t)) or sen.search(t):
             continue
+        posted = _ATS_DATES.get(u, "")
+        if posted and (days_ago(posted) or 0) > 183:          # stale posting (e.g. open since 2024) — skip
+            continue
         if not re.search(r"engineer|developer|sde|programmer|full[\s-]?stack|front[\s-]?end|back[\s-]?end|software", t, re.I):
             continue
         ok_loc = bool(location_ok(loc or "", rules)[0])
-        dev.append({"title": t, "url": u, "location": loc, "remote_or_india": ok_loc})
+        dev.append({"title": t, "url": u, "location": loc, "remote_or_india": ok_loc, "posted": _ATS_DATES.get(u, "")})
     if not dev:
         return None
     dev.sort(key=lambda r: not r["remote_or_india"])
@@ -4964,6 +5058,118 @@ def _startup_from_board(name: str, website: str, source: str, info: dict, board:
     d["score"] = _startup_score(d) + (1 if d["any_remote"] else 0)
     d["score"] = min(d["score"], 10)
     return d
+
+
+SALARY_FLOOR_EST = float(os.environ.get("SALARY_FLOOR_EST", "10"))     # typical SDE pay at the company, LPA
+
+
+def company_sde_salary(company: str) -> float | None:
+    """Typical software-engineer pay at `company` in India (LPA), from Google result snippets (Serper / Tavily — no
+    site is scraped). Cached 30 days. None = unknown (no key, or nothing found)."""
+    if not company or not (SERPER_API_KEY or TAVILY_API_KEY):
+        return None
+    ck = "sal:" + _skey(company)
+    cached = _kv_get(ck)
+    if cached:
+        try:
+            v, at = json.loads(cached)
+            if (days_ago(at) or 0) < 30:
+                return v
+        except ValueError:
+            pass
+    q = f'"{company}" software engineer salary India LPA'
+    snippets = ""
+    try:
+        if SERPER_API_KEY:
+            req = urllib.request.Request("https://google.serper.dev/search", method="POST",
+                                         data=json.dumps({"q": q, "num": 10, "gl": "in"}).encode(),
+                                         headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                res = json.loads(r.read().decode())
+            snippets = " ".join((x.get("title", "") + " " + x.get("snippet", "")) for x in res.get("organic", []))
+        else:
+            req = urllib.request.Request("https://api.tavily.com/search", method="POST",
+                                         data=json.dumps({"query": q, "max_results": 8, "search_depth": "basic"}).encode(),
+                                         headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read().decode())
+            snippets = " ".join((x.get("title", "") + " " + x.get("content", "")) for x in res.get("results", []))
+    except Exception as exc:
+        print(f"  [salary ✗] {company}: {str(exc)[:60]}")
+        return None
+    first = re.escape(company.split()[0].lower())
+    vals = []
+    for sent in re.split(r"(?<=[.!?])\s+|\s\|\s|\n", snippets):
+        if not re.search(first, sent.lower()) or re.search(r"senior|lead|manager|architect|principal|staff", sent, re.I):
+            continue
+        for a, b in re.findall(r"₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L|LPA|lakhs?)?\s*(?:-|–|to)\s*₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L\b|LPA|lakhs?)", sent, re.I):
+            lo, hi = float(a), float(b)
+            if 1 <= lo <= hi <= 80:
+                vals.append((lo + hi) / 2)
+        for a in re.findall(r"(?:average|avg|median)[^.]{0,40}?₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L\b|LPA|lakhs?)", sent, re.I):
+            vals.append(float(a))
+    v = round(sorted(vals)[len(vals) // 2], 1) if vals else None
+    _kv_set(ck, json.dumps([v, now_utc()]))
+    return v
+
+
+def startup_visible(d: dict, funded_on: str) -> bool:
+    """User rule: show a startup only if it was funded in the last 6 months, OR it has a matching open developer role
+    on its OWN job board (any location — founders can be cold-mailed). Big-company lists are not startups."""
+    if d.get("source") == "layoffsandhires":
+        return False
+    if d.get("pay_est") is not None and d["pay_est"] < SALARY_FLOOR_EST:
+        return False
+    if funded_on and (days_ago(funded_on) or 999) <= 183:
+        return True
+    return bool((d.get("roles") or {}).get("dev"))
+
+
+def revalidate_startups(rules: dict) -> dict:
+    """One pass over every stored startup: drop roles from boards that aren't the company's own (VC portfolio boards),
+    drop postings older than 6 months, then delete startups that no longer meet the visibility rule."""
+    conn = get_db()
+    rows = conn.execute("SELECT key, name, funded_on, data FROM startups").fetchall()
+    conn.close()
+
+    def work(r):
+        d = json.loads(r["data"])
+        if d.get("source") == "layoffsandhires":
+            return r["key"], None
+        board = (d.get("roles") or {}).get("board", "")
+        if r["funded_on"]:
+            if board or d.get("website"):
+                d["roles"] = _startup_roles(d["name"], d.get("website", ""), d.get("careers", ""), rules)
+        elif board:
+            info = {"team": (d.get("size") or {}).get("count", ""), "about": d.get("description", ""), "yc": d.get("round", ""),
+                    "locations": d.get("hq", ""), "yc_url": d.get("yc_url", "")}
+            fresh = _startup_from_board(d["name"], d.get("website", ""), d.get("source", ""), info, board, rules)
+            if not fresh:
+                return r["key"], None
+            for k in ("emails", "profiles", "founders", "founder_links", "company_linkedin", "careers"):
+                if d.get(k):
+                    fresh[k] = d[k]
+            d = fresh
+        if r["funded_on"] or re.search(r"india|bengaluru|bangalore|hyderabad|pune|mumbai|delhi|gurugram|noida|chennai", d.get("hq", "") or "", re.I):
+            d["pay_est"] = company_sde_salary(d["name"])
+        d["score"] = _startup_score(d)
+        return r["key"], d if startup_visible(d, r["funded_on"]) else None
+
+    with ThreadPoolExecutor(10) as ex:
+        res = list(ex.map(work, rows))
+    conn = get_db()
+    kept = removed = 0
+    for k, d in res:
+        if d is None:
+            conn.execute("DELETE FROM startups WHERE key=?", (k,))
+            removed += 1
+        else:
+            conn.execute("UPDATE startups SET data=?, score=? WHERE key=?", (json.dumps(d), d["score"], k))
+            kept += 1
+    conn.commit()
+    conn.close()
+    print(f"[startups] re-validated: kept {kept}, removed {removed}")
+    return {"kept": kept, "removed": removed}
 
 
 def _enrich_discovered(d: dict) -> dict:
@@ -5056,7 +5262,7 @@ def run_discovery(rules: dict) -> dict:
             info = json.loads(r["info"] or "{}")
             board = detect_board(r["name"], r["website"], info.get("careers", ""))
             su = None
-            if board and r["source"] in ("yc", "remoteintech", "news", "linkedin", "layoffsandhires", "hn", "lists", "jobboards") and board.split(":")[0] in _SIMPLE_ATS:
+            if board and r["source"] in ("yc", "remoteintech", "news", "linkedin", "hn", "lists", "jobboards") and board.split(":")[0] in _SIMPLE_ATS:
                 su = _startup_from_board(r["name"], r["website"], r["source"], info, board, rules)
             return r["key"], r["source"], board, su
         except Exception:
@@ -5600,7 +5806,7 @@ function renderStartups(){
     ${emails?`<span>✉ ${emails}</span>`:''}
     <span>🔎 <a href="${esc(s.recruiter_search||'')}" target="_blank">Find their recruiter / HR on LinkedIn</a></span>
   </div>
-  ${dev.length?`<div class="notes">🟢 Open developer roles (${dev.length}${s.roles.total?` of ${s.roles.total} open`:''}): ${dev.map(r=>`<a href="${esc(r.url)}" target="_blank">${esc(r.title)}</a>${r.location?' ('+esc(r.location)+')':''}`).join(' · ')}</div>`
+  ${dev.length?`<div class="notes">🟢 Open developer roles (${dev.length}${s.roles.total?` of ${s.roles.total} open`:''}): ${dev.map(r=>`<a href="${esc(r.url)}" target="_blank">${esc(r.title)}</a>${r.location?' ('+esc(r.location)+')':''}${r.posted?' <span style="opacity:.7">· posted '+esc(r.posted)+'</span>':''}`).join(' · ')}</div>`
              : (s.roles&&s.roles.total?`<div class="notes">${s.roles.total} open roles on their careers board (none match your stack yet)</div>`:'')}
   ${(s.hiring_posts||[]).map(p=>`<div class="notes">📢 Hiring post ${esc(p.date||'')}: ${esc(p.text.slice(0,160))}… <a href="${esc(p.url)}" target="_blank">View ↗</a></div>`).join('')}
   <div class="actions">
@@ -5914,10 +6120,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/startups":
             conn = get_db()
             rows = conn.execute("SELECT key, name, funded_on, data, score, status FROM startups "
-                                "WHERE funded_on >= ? OR funded_on = '' ORDER BY score DESC, funded_on DESC LIMIT 6000",
-                                ((datetime.now() - timedelta(days=183)).strftime("%Y-%m-%d"),)).fetchall()
+                                "ORDER BY score DESC, funded_on DESC LIMIT 8000").fetchall()
             conn.close()
-            self._json([{**json.loads(r["data"]), "key": r["key"], "score": r["score"], "status": r["status"]} for r in rows])
+            self._json([{**json.loads(r["data"]), "key": r["key"], "score": r["score"], "status": r["status"]} for r in rows
+                        if startup_visible(json.loads(r["data"]), r["funded_on"])])
             return
 
         if path == "/api/posts":
