@@ -4190,6 +4190,13 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _SCRAPE_BUDGET["left"] = int(os.environ.get("SCRAPE_BUDGET", "80"))
     rules = load_rules()
     conn = get_db()
+    if _kv_get("pay_fix") != "v1":                     # undo pay judgements made on too-generic company names
+        for tok in ("imc", "safe", "plane", "agency", "diagrid", "truveta", "xometry", "broccoli", "tether", "tru"):
+            conn.execute("DELETE FROM kv WHERE k=?", ("sal:" + tok,))
+            conn.execute("DELETE FROM seen_jobs WHERE url LIKE ?", (f"%/{tok}/%",))
+            conn.execute("DELETE FROM seen_jobs WHERE url LIKE ?", (f"%/{tok}-%",))
+        conn.commit()
+        _kv_set("pay_fix", "v1")
     if _kv_get("rules_version") != "2026-11-25-py-java":    # stack / experience rules changed → re-judge URLs rejected under the old rules
         conn.execute("DELETE FROM rejected_urls")
         conn.commit()
@@ -5076,6 +5083,9 @@ def company_sde_salary(company: str) -> float | None:
     site is scraped). Cached 30 days. None = unknown (no key, or nothing found)."""
     if not company or not (SERPER_API_KEY or TAVILY_API_KEY):
         return None
+    words = re.findall(r"[a-z0-9]+", company.lower())
+    if len(words) == 1 and len(words[0]) < 7:          # 'IMC', 'Safe', 'Plane' … too generic to search reliably
+        return None
     ck = "sal:" + _skey(company)
     cached = _kv_get(ck)
     if cached:
@@ -5105,7 +5115,8 @@ def company_sde_salary(company: str) -> float | None:
     except Exception as exc:
         print(f"  [salary ✗] {company}: {str(exc)[:60]}")
         return None
-    first = re.sub(r"[^a-z0-9]", "", company.split()[0].lower())
+    first = re.sub(r"[^a-z0-9]", "", " ".join(w for w in company.split() if not re.fullmatch(r"(?i)inc\.?|ltd\.?|llc|pvt\.?|private|limited|technologies|solutions|software|labs?|ai|tech", w)) .lower()) \
+        or re.sub(r"[^a-z0-9]", "", company.lower())
     vals = []
     for res_txt in snippets:
         if first not in re.sub(r"[^a-z0-9 ]", "", res_txt.lower()).replace(" ", ""):
