@@ -4386,7 +4386,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         if SERPER_API_KEY or TAVILY_API_KEY:                  # stored India jobs with no stated pay: check the company
             c2 = get_db()
             rows = c2.execute("SELECT id, company, location, notes FROM jobs WHERE status NOT IN ('applied','saved') "
-                              "AND IFNULL(salary,'')='' AND IFNULL(notes,'') NOT LIKE '%Typical SDE pay%' LIMIT 80").fetchall()
+                              "AND IFNULL(salary,'')='' AND IFNULL(notes,'') NOT LIKE '%Typical SDE pay%' AND IFNULL(notes,'') NOT LIKE '%pay: unknown%' LIMIT 300").fetchall()
             c2.close()
             decisions = []                                    # look everything up first (lookups write to kv) …
             for r in rows:
@@ -4402,6 +4402,8 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
                     low_pay += 1
                 elif est is not None:
                     c2.execute("UPDATE jobs SET notes=? WHERE id=?", (((r["notes"] or "") + f" Typical SDE pay at {r['company']}: ~{est} LPA.").strip(), r["id"]))
+                else:
+                    c2.execute("UPDATE jobs SET notes=? WHERE id=?", (((r["notes"] or "") + " Company pay: unknown.").strip(), r["id"]))
             c2.commit()
             c2.close()
             print(f"[pay] checked {len(decisions)} · removed {low_pay} stored jobs at companies paying under {SALARY_FLOOR_EST:g} LPA")
