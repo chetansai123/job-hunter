@@ -2650,7 +2650,7 @@ def _search_post_urls(query: str) -> list[str]:
     try:
         if SERPER_API_KEY:
             req = urllib.request.Request("https://google.serper.dev/search", method="POST",
-                                         data=json.dumps({"q": f"site:linkedin.com/posts {query}", "num": 20, "tbs": "qdr:m"}).encode(),
+                                         data=json.dumps({"q": f"site:linkedin.com/posts {query}", "tbs": "qdr:w"}).encode(),
                                          headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 out = [x.get("link", "") for x in json.loads(r.read().decode()).get("organic", [])]
@@ -5077,37 +5077,40 @@ def company_sde_salary(company: str) -> float | None:
                 return v
         except ValueError:
             pass
-    q = f'"{company}" software engineer salary India LPA'
+    q = f'{company} software engineer salary India'
     snippets = ""
     try:
         if SERPER_API_KEY:
             req = urllib.request.Request("https://google.serper.dev/search", method="POST",
-                                         data=json.dumps({"q": q, "num": 10, "gl": "in"}).encode(),
+                                         data=json.dumps({"q": q, "gl": "in"}).encode(),
                                          headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=25) as r:
                 res = json.loads(r.read().decode())
-            snippets = " ".join((x.get("title", "") + " " + x.get("snippet", "")) for x in res.get("organic", []))
+            snippets = [(x.get("title", "") + " | " + x.get("snippet", "")) for x in res.get("organic", [])]
         else:
             req = urllib.request.Request("https://api.tavily.com/search", method="POST",
                                          data=json.dumps({"query": q, "max_results": 8, "search_depth": "basic"}).encode(),
                                          headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 res = json.loads(r.read().decode())
-            snippets = " ".join((x.get("title", "") + " " + x.get("content", "")) for x in res.get("results", []))
+            snippets = [(x.get("title", "") + " | " + x.get("content", "")) for x in res.get("results", [])]
     except Exception as exc:
         print(f"  [salary ✗] {company}: {str(exc)[:60]}")
         return None
-    first = re.escape(company.split()[0].lower())
+    first = re.sub(r"[^a-z0-9]", "", company.split()[0].lower())
     vals = []
-    for sent in re.split(r"(?<=[.!?])\s+|\s\|\s|\n", snippets):
-        if not re.search(first, sent.lower()) or re.search(r"senior|lead|manager|architect|principal|staff", sent, re.I):
+    for res_txt in snippets:
+        if first not in re.sub(r"[^a-z0-9 ]", "", res_txt.lower()).replace(" ", ""):
             continue
-        for a, b in re.findall(r"₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L|LPA|lakhs?)?\s*(?:-|–|to)\s*₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L\b|LPA|lakhs?)", sent, re.I):
-            lo, hi = float(a), float(b)
-            if 1 <= lo <= hi <= 80:
-                vals.append((lo + hi) / 2)
-        for a in re.findall(r"(?:average|avg|median)[^.]{0,40}?₹?\s*(\d{1,2}(?:\.\d)?)\s*(?:L\b|LPA|lakhs?)", sent, re.I):
-            vals.append(float(a))
+        if not re.search(r"salar", res_txt, re.I) or re.search(r"\bjobs? (?:in|vacanc)|hiring|years of experience|\d+\s*(?:-|to)\s*\d+\s*yrs", res_txt, re.I):
+            continue                                   # salary pages only — not job listings (those are senior-skewed)
+        for seg in re.split(r";|\s\|\s|\n|\.\s+(?=[A-Z])", res_txt):
+            if re.search(r"senior|sr\.|lead|manager|architect|principal|staff|director|head", seg, re.I):
+                continue
+            for a_, b_ in re.findall(r"₹?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(?:L\b|LPA|lakhs?|L/yr)?\s*(?:-|–|to)\s*₹?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(?:L\b|LPA|lakhs?|L/yr)", seg, re.I):
+                lo, hi = float(a_), float(b_)
+                if 1 <= lo <= hi <= 80:
+                    vals.append((lo + hi) / 2)
     v = round(sorted(vals)[len(vals) // 2], 1) if vals else None
     _kv_set(ck, json.dumps([v, now_utc()]))
     return v
