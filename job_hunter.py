@@ -4467,7 +4467,11 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         revet_existing_posts(rules)                     # posts are re-judged with the current rules on every run
         conn = get_db()
         cut = 0
-        for r in conn.execute("SELECT id, experience_req FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
+        for r in conn.execute("SELECT id, experience_req, title FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
+            if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack[\s\-–(:/,]*java\b", (r["title"] or "").lower()):
+                conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))      # Java full-stack titles — never your stack
+                cut += 1
+                continue
             mm = re.match(r"\s*(\d+)", r["experience_req"] or "")
             if mm and int(mm.group(1)) > rules.get("experience", {}).get("max_min_years", 3):
                 conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
