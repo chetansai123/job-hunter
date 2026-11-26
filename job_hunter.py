@@ -4299,6 +4299,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
                 pass
     _stage(f"saving {len(accepted)} jobs")
     if SERPER_API_KEY or TAVILY_API_KEY:
+        conn.commit()                                  # pay lookups write to kv on their own connection
         keep = []
         for job in accepted:
             india = not re.search(r"remote|worldwide|anywhere", job.get("location", "") or "", re.I) or "india" in (job.get("location", "") or "").lower()
@@ -4383,22 +4384,27 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.close()
         print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit")
         if SERPER_API_KEY or TAVILY_API_KEY:                  # stored India jobs with no stated pay: check the company
-            conn = get_db()
-            low_pay = 0
-            for r in conn.execute("SELECT id, company, location, notes FROM jobs WHERE status NOT IN ('applied','saved') "
-                                  "AND IFNULL(salary,'')='' AND IFNULL(notes,'') NOT LIKE '%Typical SDE pay%' LIMIT 60").fetchall():
+            c2 = get_db()
+            rows = c2.execute("SELECT id, company, location, notes FROM jobs WHERE status NOT IN ('applied','saved') "
+                              "AND IFNULL(salary,'')='' AND IFNULL(notes,'') NOT LIKE '%Typical SDE pay%' LIMIT 80").fetchall()
+            c2.close()
+            decisions = []                                    # look everything up first (lookups write to kv) …
+            for r in rows:
                 loc = (r["location"] or "").lower()
                 if re.search(r"remote|worldwide|anywhere", loc) and "india" not in loc:
                     continue
-                est = company_sde_salary(r["company"])
+                decisions.append((r, company_sde_salary(r["company"])))
+            c2 = get_db()                                     # … then write in one transaction
+            low_pay = 0
+            for r, est in decisions:
                 if est is not None and est < SALARY_FLOOR_EST:
-                    conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+                    c2.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
                     low_pay += 1
                 elif est is not None:
-                    conn.execute("UPDATE jobs SET notes=? WHERE id=?", (((r["notes"] or "") + f" Typical SDE pay at {r['company']}: ~{est} LPA.").strip(), r["id"]))
-            conn.commit()
-            conn.close()
-            print(f"[pay] removed {low_pay} stored jobs at companies paying under {SALARY_FLOOR_EST:g} LPA")
+                    c2.execute("UPDATE jobs SET notes=? WHERE id=?", (((r["notes"] or "") + f" Typical SDE pay at {r['company']}: ~{est} LPA.").strip(), r["id"]))
+            c2.commit()
+            c2.close()
+            print(f"[pay] checked {len(decisions)} · removed {low_pay} stored jobs at companies paying under {SALARY_FLOOR_EST:g} LPA")
         conn = get_db()
         conn.execute("DELETE FROM jobs WHERE link_type='board' AND status!='applied' AND IFNULL(apply_email,'')=''")
         conn.commit()
