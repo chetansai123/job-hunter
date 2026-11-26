@@ -1023,6 +1023,13 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
         tier = "other"
     if tier != "other" and not core_title and wrong_occ >= 3 and wrong_occ > 2 * core_occ:
         tier = "other"
+    # Java rule (user, 2026-11-26): plain Java is fine, but NOT Java full-stack roles and NOT anything Spring-based.
+    if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack\s*(?:\(\s*)?java\b|java\s*(?:/|\+|&|and)\s*react|react\s*(?:/|\+|&|and)\s*java", t):
+        return False, "Java full-stack role (Spring-based — not your stack)", {}
+    if re.search(r"\bjava\b", full) and re.search(r"\bspring\b|springboot|hibernate|\bj2ee\b|\bjsp\b|\bstruts\b|\bjpa\b", full):
+        return False, "Java + Spring / Hibernate in the JD", {}
+    if re.search(r"\bjava\b", t) and re.search(r"micro-?services?", full):
+        return False, "Java microservices role (Spring-based)", {}
     # Roles built on frameworks outside the candidate's reach (Spring Boot, .NET, Django, PHP …) are rejected;
     # plain Java / Python roles are fine.
     blocked = list(S.get("blocked", []))
@@ -3517,6 +3524,67 @@ def _html_to_text(h: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", h).strip()
 
 
+_POSTED_CACHE: dict = {}
+
+
+def posting_date(url: str, hint: str = "", source: str = "") -> str:
+    """When the job was FIRST published (YYYY-MM-DD), from the job system itself — never 'last updated' (Greenhouse /
+    Lever refresh that and make old roles look new). '' when it can't be verified."""
+    if url in _POSTED_CACHE:
+        return _POSTED_CACHE[url]
+    d = ""
+    try:
+        m = re.search(r"https?://(?:job-boards|boards)(\.eu)?\.greenhouse\.io/([^/]+)/jobs/(\d+)", url)
+        gj = re.search(r"[?&]gh_jid=(\d+)", url)
+        if m or (gj and source.startswith("ats:greenhouse:")):
+            eu, tok, jid = (m.group(1) or "", m.group(2), m.group(3)) if m else ("", source.split(":")[2], gj.group(1))
+            j = http_get(f"https://boards-api{eu}.greenhouse.io/v1/boards/{tok}/jobs/{jid}", timeout=15, quiet=True)
+            if isinstance(j, dict):
+                d = (j.get("first_published") or "")[:10]
+        elif (m := re.search(r"https?://jobs(\.eu)?\.lever\.co/([^/]+)/([0-9a-f-]{36})", url)):
+            j = http_get(f"https://api{m.group(1) or ''}.lever.co/v0/postings/{m.group(2)}/{m.group(3)}", timeout=15, quiet=True)
+            if isinstance(j, dict) and j.get("createdAt"):
+                d = datetime.fromtimestamp(j["createdAt"] / 1000, timezone.utc).strftime("%Y-%m-%d")
+        elif (m := re.search(r"https?://jobs\.ashbyhq\.com/([^/]+)/([0-9a-f-]{36})", url)):
+            _ats_postings("ashby", m.group(1))
+            d = next((v for k, v in _ATS_DATES.items() if m.group(2) in k), "")
+        elif (m := re.search(r"https?://jobs\.smartrecruiters\.com/([^/]+)/(\d+)", url)):
+            j = http_get(f"https://api.smartrecruiters.com/v1/companies/{m.group(1)}/postings/{m.group(2)}", timeout=15, quiet=True)
+            if isinstance(j, dict):
+                d = (j.get("releasedDate") or "")[:10]
+        elif (m := re.search(r"https?://apply\.workable\.com/([^/]+)/j/([A-Z0-9]+)", url)):
+            req = urllib.request.Request(f"https://apply.workable.com/api/v2/accounts/{m.group(1)}/jobs/{m.group(2)}",
+                                         headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = (json.loads(r.read()).get("published") or "")[:10]
+        elif (m := re.search(r"https?://([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)(/job/.+?)(?:[?#]|$)", url, re.I)):
+            tenant = m.group(1)
+            api = f"https://{m.group(1)}.{m.group(2)}.myworkdayjobs.com/wday/cxs/{tenant}/{m.group(3)}{m.group(4)}"
+            j = http_get(api, timeout=20, quiet=True)
+            if not isinstance(j, dict):
+                time.sleep(3)
+                j = http_get(api, timeout=20, quiet=True)
+            if isinstance(j, dict):
+                d = ((j.get("jobPostingInfo") or {}).get("startDate") or "")[:10]
+        elif "linkedin.com/jobs/view" in url:
+            d = (hint or "")[:10]
+        else:                                                    # company careers page / other ATS: JSON-LD datePosted
+            h = http_get_text(url, 20, quiet=True) or ""
+            mm = re.search(r'"datePosted"\s*:\s*"(\d{4}-\d{2}-\d{2})', h)
+            if mm:
+                d = mm.group(1)
+            else:
+                ago = re.search(r"posted\s+(\d+)\s+days?\s+ago", h, re.I)
+                if ago:
+                    d = (datetime.now(timezone.utc) - timedelta(days=int(ago.group(1)))).strftime("%Y-%m-%d")
+                elif re.search(r"posted\s+(?:today|yesterday|just now|\d+\s+hours?\s+ago)", h, re.I):
+                    d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        d = ""
+    _POSTED_CACHE[url] = d
+    return d
+
+
 def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     """Open the job, make sure it is still active, read the FULL JD, find the best apply link,
     then apply every rule. Returns (job, 'ok') or (None, reason)."""
@@ -3655,6 +3723,14 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
             ("other stack: " + (", ".join(info["wrong"][:3]) or "not JS"))
     job["match_reason"] = (f"JD read ({len(jd):,} chars) · {stack} · exp: {info['exp']}"
                            + (f" · via {job['board']}" if job.get("board") else ""))
+    opened = posting_date(url, job.get("posted_date", "") or job.get("date", ""), src)
+    max_days = rules.get("freshness", {}).get("max_age_days", 40)
+    if not opened:
+        return None, "opening date could not be verified"
+    age = days_ago(opened)
+    if age is not None and age > max_days:
+        return None, f"opened {opened} ({age} days ago) — older than {max_days} days"
+    job["posted_date"] = opened
     job["_sig"] = hashlib.md5(re.sub(r"\W+", "", jd.lower())[:800].encode()).hexdigest()
     return job, "ok"
 
@@ -3890,8 +3966,8 @@ def revet_existing_jobs(rules: dict, limit: int | None = None, stale_hours: floa
         okh, whyh = passes_hard_filters(r["title"], r["company"], r["direct_apply_url"], "", rules)
         if not okh:
             return r, None, whyh
-        if r["posted_date"] and not str(r["discovery_source"]).startswith("ats:") and (days_ago(r["posted_date"]) or 0) > 60:
-            return r, None, "stale posting (> 60 days old)"
+        if r["posted_date"] and (days_ago(r["posted_date"]) or 0) > rules.get("freshness", {}).get("max_age_days", 40):
+            return r, None, f"stale posting (opened {r['posted_date']})"
         loc = r["location"] if r["location"] and r["location"] != "Remote / not stated" else ""
         j = _job(r["company"], r["title"], r["direct_apply_url"], "revet", rules, location=loc, need_fetch=True,
                  salary=r["salary"], date=r["posted_date"])
@@ -4352,10 +4428,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     purge_posts_once(conn)
-    if _kv_get("startups_revalidated") != "v1":
+    if _due("startups_revalidated_at", 20):            # once a day: roles must still be open on the live board
         try:
             revalidate_startups(rules)
-            _kv_set("startups_revalidated", "v1")
+            _kv_set("startups_revalidated_at", now_utc())
         except Exception as exc:
             print(f"  [!] startup re-validation failed: {exc}")
     posts_added, post_rejects = ingest_posts(conn, rules, post_fns, per_source)
@@ -4377,7 +4453,11 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
     _stage("re-checking stored jobs")
     try:
-        revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
+        if _kv_get("jobs_rejudged") != "v-date-java":
+            revet_existing_jobs(rules, limit=100000, stale_hours=0)     # every stored job, once, with the new rules
+            _kv_set("jobs_rejudged", "v-date-java")
+        else:
+            revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.commit()
         revet_existing_posts(rules)                     # posts are re-judged with the current rules on every run
         conn = get_db()
@@ -4579,7 +4659,7 @@ def _startup_roles(name: str, website: str, careers: str, rules: dict) -> dict:
         dev = [{"title": t, "url": u, "location": loc, "posted": _ATS_DATES.get(u, "")} for t, u, loc in posts
                if u and title_relevant(t) and passes_hard_filters(t, name, u, "", rules)[0]
                and not re.search(r"analyst|\btest\b|qa\b|sdet|support|sales|designer", t, re.I)
-               and not (_ATS_DATES.get(u) and (days_ago(_ATS_DATES[u]) or 0) > 183)]
+               and not (_ATS_DATES.get(u) and (days_ago(_ATS_DATES[u]) or 0) > 365)]
         conn = get_db()
         try:
             if kind in ("greenhouse", "lever", "ashby", "keka", "zoho"):
@@ -5050,7 +5130,7 @@ def _startup_from_board(name: str, website: str, source: str, info: dict, board:
         if not (u and title_relevant(t)) or sen.search(t):
             continue
         posted = _ATS_DATES.get(u, "")
-        if posted and (days_ago(posted) or 0) > 183:          # stale posting (e.g. open since 2024) — skip
+        if posted and (days_ago(posted) or 0) > 365:          # still listed but open > 1 year = evergreen / ghost posting
             continue
         if not re.search(r"engineer|developer|sde|programmer|full[\s-]?stack|front[\s-]?end|back[\s-]?end|software", t, re.I):
             continue
@@ -5136,8 +5216,9 @@ def company_sde_salary(company: str) -> float | None:
 
 
 def startup_visible(d: dict, funded_on: str) -> bool:
-    """User rule: show a startup only if it was funded in the last 6 months, OR it has a matching open developer role
-    on its OWN job board (any location — founders can be cold-mailed). Big-company lists are not startups."""
+    """User rule: show a startup only if it was funded in the last 6 months, OR it has a developer role that is OPEN RIGHT
+    NOW on its OWN job board (any location — founders can be cold-mailed). Roles are re-checked against the live board
+    every day; closed ones disappear. Big-company lists are not startups."""
     if d.get("source") == "layoffsandhires":
         return False
     if d.get("pay_est") is not None and d["pay_est"] < SALARY_FLOOR_EST:
