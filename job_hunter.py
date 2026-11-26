@@ -1024,7 +1024,7 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
     if tier != "other" and not core_title and wrong_occ >= 3 and wrong_occ > 2 * core_occ:
         tier = "other"
     # Java rule (user, 2026-11-26): plain Java is fine, but NOT Java full-stack roles and NOT anything Spring-based.
-    if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack\s*(?:\(\s*)?java\b|java\s*(?:/|\+|&|and)\s*react|react\s*(?:/|\+|&|and)\s*java", t):
+    if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack[\s\-–(:/,]*java\b|java\s*(?:/|\+|&|and)\s*react|react\s*(?:/|\+|&|and)\s*java", t):
         return False, "Java full-stack role (Spring-based — not your stack)", {}
     if re.search(r"\bjava\b", full) and re.search(r"\bspring\b|springboot|hibernate|\bj2ee\b|\bjsp\b|\bstruts\b|\bjpa\b", full):
         return False, "Java + Spring / Hibernate in the JD", {}
@@ -3557,13 +3557,18 @@ def posting_date(url: str, hint: str = "", source: str = "") -> str:
                                          headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 d = (json.loads(r.read()).get("published") or "")[:10]
-        elif (m := re.search(r"https?://([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)(/job/.+?)(?:[?#]|$)", url, re.I)):
-            tenant = m.group(1)
-            api = f"https://{m.group(1)}.{m.group(2)}.myworkdayjobs.com/wday/cxs/{tenant}/{m.group(3)}{m.group(4)}"
-            j = http_get(api, timeout=20, quiet=True)
-            if not isinstance(j, dict):
-                time.sleep(3)
+        elif (m := re.search(r"https?://([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)(/job/.+?)(?:[?#]|$)", url, re.I)) or \
+                (m2 := re.search(r"https?://(wd\d+)\.myworkdaysite\.com/(?:[a-z]{2}-[A-Z]{2}/)?recruiting/([^/]+)/([^/]+)(/job/.+?)(?:[?#]|$)", url, re.I)):
+            if m:
+                api = f"https://{m.group(1)}.{m.group(2)}.myworkdayjobs.com/wday/cxs/{m.group(1)}/{m.group(3)}{m.group(4)}"
+            else:
+                api = f"https://{m2.group(1)}.myworkdaysite.com/wday/cxs/{m2.group(2)}/{m2.group(3)}{m2.group(4)}"
+            j = None
+            for attempt in range(3):
                 j = http_get(api, timeout=20, quiet=True)
+                if isinstance(j, dict):
+                    break
+                time.sleep(3 + attempt * 4)
             if isinstance(j, dict):
                 d = ((j.get("jobPostingInfo") or {}).get("startDate") or "")[:10]
         elif "linkedin.com/jobs/view" in url:
@@ -4470,6 +4475,35 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.commit()
         conn.close()
         print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit")
+        c3 = get_db()
+        undated = c3.execute("SELECT id, direct_apply_url, discovery_source, notes FROM jobs WHERE status NOT IN ('applied','saved') "
+                             "AND IFNULL(posted_date,'')='' LIMIT 200").fetchall()
+        c3.close()
+        tries = json.loads(_kv_get("date_tries") or "{}")
+        found = [(r, posting_date(r["direct_apply_url"], "", r["discovery_source"] or "")) for r in undated]
+        c3 = get_db()
+        dated = dropped = 0
+        maxd = rules.get("freshness", {}).get("max_age_days", 40)
+        for r, d in found:
+            k = str(r["id"])
+            if d:
+                if (days_ago(d) or 0) > maxd:
+                    c3.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+                    dropped += 1
+                else:
+                    c3.execute("UPDATE jobs SET posted_date=? WHERE id=?", (d, r["id"]))
+                    dated += 1
+                tries.pop(k, None)
+            else:
+                tries[k] = tries.get(k, 0) + 1
+                if tries[k] >= 3:                         # three scans in a row with no verifiable date → drop
+                    c3.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+                    dropped += 1
+                    tries.pop(k, None)
+        c3.commit()
+        c3.close()
+        _kv_set("date_tries", json.dumps(tries))
+        print(f"[dates] undated {len(undated)} · dated {dated} · removed {dropped} (old or unverifiable 3×)")
         if SERPER_API_KEY or TAVILY_API_KEY:                  # stored India jobs with no stated pay: check the company
             c2 = get_db()
             rows = c2.execute("SELECT id, company, location, notes FROM jobs WHERE status NOT IN ('applied','saved') "
