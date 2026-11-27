@@ -323,6 +323,7 @@ def init_db() -> None:
         "ALTER TABLE jobs      ADD COLUMN checked_at TEXT DEFAULT ''",
         "ALTER TABLE posts     ADD COLUMN dedup_key TEXT DEFAULT ''",
         "ALTER TABLE ats_boards ADD COLUMN last_polled TEXT DEFAULT ''",
+        "ALTER TABLE workday_boards ADD COLUMN last_polled TEXT DEFAULT ''",
         "ALTER TABLE posts     ADD COLUMN norm_text TEXT DEFAULT ''",
     ]
     for sql in _migrations:
@@ -2194,20 +2195,25 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
     keeps the role if the company's own ATS posting (or an apply e-mail in the JD) is found."""
     out: list[dict] = []
     seen_ids: set[str] = set()
-    combos = [(k, loc) for k in _LI_KEYWORDS for loc in ("India", "Bengaluru", "Hyderabad", "Pune", "Remote India")] + \
-             [(k, "Worldwide") for k in _LI_KEYWORDS[:8]]
-    deadline = time.time() + int(os.environ.get("LINKEDIN_BUDGET_SECS", "200"))
+    light = SCAN_MODE == "light"
+    if light:                                             # every 30 min: only roles posted in the last 24 h, all of India
+        combos = [(k, "India", "r86400", (0, 25)) for k in _LI_KEYWORDS[:10]]
+    else:                                                 # full scan: all of India (every city) + India-remote + worldwide remote
+        combos = [(k, "India", "r1209600", (0, 25, 50, 75, 100, 125, 150, 175)) for k in _LI_KEYWORDS] + \
+                 [(k, "India", "r1209600&f_WT=2", (0, 25, 50)) for k in _LI_KEYWORDS[:12]] + \
+                 [(k, "Worldwide", "r1209600&f_WT=2", (0, 25)) for k in _LI_KEYWORDS[:8]]
+    deadline = time.time() + int(os.environ.get("LINKEDIN_BUDGET_SECS", "110" if light else "480"))
 
     def fetch(kv):
-        k, loc = kv
+        k, loc, tpr, starts = kv
         res = []
         if time.time() > deadline:
             return res
-        for start in (0, 25, 50, 75):
+        for start in starts:
             h = ""
             for attempt in range(3):                              # LinkedIn answers 429 when hit too fast → back off
                 h = http_get_text("https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
-                                  f"keywords={urllib.parse.quote(k)}&location={urllib.parse.quote(loc)}&f_TPR=r1209600&f_E=2%2C3&start={start}",
+                                  f"keywords={urllib.parse.quote(k)}&location={urllib.parse.quote(loc)}&f_TPR={tpr}&f_E=2%2C3&start={start}",
                                   timeout=25, quiet=True)
                 if h:
                     break
@@ -2249,6 +2255,13 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
         time.sleep(0.5)
         m = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', h or "", re.S)
         jd = _html_to_text(m.group(1)) if m else ""
+        if not date:                                        # "2 days ago" on the posting itself
+            ago = re.search(r'posted-time-ago__text[^>]*>\s*(\d+)\s+(minute|hour|day|week|month)s?\s+ago', h or "")
+            if ago:
+                n, unit = int(ago.group(1)), ago.group(2)
+                days = {"minute": 0, "hour": 0, "day": n, "week": 7 * n, "month": 30 * n}[unit]
+                date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+                c = (jid, title, comp, loc, date)
         poster = None                                       # "Direct message the job poster" = the real recruiter / hiring manager
         pm = re.search(r'message-the-recruiter.*?href="(https://[a-z.]*linkedin\.com/in/[^"?]+)[^"]*".*?<span class="sr-only">\s*([^<]+?)\s*(?:<|$)',
                        h or "", re.S)
@@ -3100,15 +3113,67 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
     return out
 
 
+_DATASET_PAGES = ("https://datahub.io/lastroundai-hiring-data/lastroundai-hiring-data/ats-directory",)
+_DATASET_CSV = "https://datahub.io/lastroundai-hiring-data/lastroundai-hiring-data/_r/-/ats-directory/lastroundai-ats-company-directory-2026-08.csv"
+_OPEN_JOBS_JSON = "https://raw.githubusercontent.com/ConorsCode/open-jobs-data/main/companies.json"
+
+
+def import_board_datasets(conn: sqlite3.Connection) -> int:
+    """Public directories of companies' Greenhouse / Lever / Ashby / Workday boards (LastRound AI ATS directory ~10k,
+    open-jobs-data). Dead boards drop out by themselves after 3 failed polls."""
+    import csv, io
+    rows: list[tuple[str, str]] = []
+    wd: list[tuple[str, str, str]] = []
+    csv_url = _DATASET_CSV
+    for pg in _DATASET_PAGES:                                   # newest monthly file if the page lists one
+        h = http_get_text(pg, 30, quiet=True) or ""
+        links = sorted(set(re.findall(r'https://datahub\.io/[^"\s]+ats-directory/[^"\s]+\.csv', h)))
+        if links:
+            csv_url = links[-1]
+    try:
+        req = urllib.request.Request(csv_url, headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            for row in csv.DictReader(io.StringIO(r.read().decode("utf-8", "ignore"))):
+                k, t = (row.get("ats_vendor") or "").strip().lower(), (row.get("board_slug") or "").strip().lower()
+                if k in ("greenhouse", "lever", "ashby") and t and t not in _BAD_TOKENS:
+                    rows.append((k, t))
+    except Exception as exc:
+        print(f"  [datasets ✗] lastround: {exc}")
+    d = http_get(_OPEN_JOBS_JSON, timeout=40, quiet=True)
+    for o in d if isinstance(d, list) else []:
+        k = (o.get("platform") or "").lower()
+        if k in ("greenhouse", "lever", "ashby") and o.get("slug"):
+            rows.append((k, o["slug"].lower()))
+        elif k == "workday" and isinstance(o.get("workday"), dict):
+            w = o["workday"]
+            if w.get("tenant") and w.get("site") and w.get("shard"):
+                wd.append((f"{w['tenant']}.{w['shard']}.myworkdayjobs.com".lower(), w["tenant"].lower(), w["site"]))
+    n = 0
+    stamp = now_utc()
+    for k, t in rows:
+        n += conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (k, t, "dataset", stamp)).rowcount
+    for b in wd:
+        n += conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)", (*b, "dataset")).rowcount
+    conn.commit()
+    print(f"[datasets] {len(rows)} ATS boards + {len(wd)} Workday sites listed → {n} new")
+    return n if rows else -1                                   # -1 = download failed → retry next scan
+
+
 def collect_ats_boards(rules: dict) -> list[dict]:
     """Polls company boards in rotation (least recently polled first) so the list can grow to thousands."""
     conn = get_db()
+    if _due("board_datasets_at", 24 * 7):
+        try:
+            if import_board_datasets(conn) >= 0:
+                _kv_set("board_datasets_at", now_utc())
+        except Exception as exc:
+            print(f"  [datasets ✗] {exc}")
     for kind, toks in rules.get("ats_boards", {}).items():
         if isinstance(toks, list):
             for t in toks:
                 conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, t.lower(), "seed", now_utc()))
     conn.commit()
-    limit = int(os.environ.get("BOARDS_PER_RUN", "1500" if SCAN_MODE != "light" else "450"))
+    limit = int(os.environ.get("BOARDS_PER_RUN", "2500" if SCAN_MODE != "light" else "800"))
     total = conn.execute("SELECT COUNT(*) FROM ats_boards WHERE failures < 3").fetchone()[0]
     boards = [(r["kind"], r["token"]) for r in conn.execute(
         "SELECT kind, token FROM ats_boards WHERE failures < 3 ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (limit,))]
@@ -3117,7 +3182,7 @@ def collect_ats_boards(rules: dict) -> list[dict]:
     conn.commit()
     conn.close()
     print(f"[ats-boards] polling {len(boards)} of {total} company boards (rotation)...")
-    with ThreadPoolExecutor(10) as ex:
+    with ThreadPoolExecutor(20) as ex:
         results = list(ex.map(lambda b: _fetch_board(b, rules), boards))
     out = [j for r in results for j in r]
     print(f"  → {len(out)} candidate roles (India/remote-eligible, title-filtered)")
@@ -3214,7 +3279,12 @@ def collect_workday(rules: dict) -> list[dict]:
         conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)",
                      (b["host"], b["tenant"], b["site"], "seed"))
     conn.commit()
-    boards = [(r["host"], r["tenant"], r["site"]) for r in conn.execute("SELECT host, tenant, site FROM workday_boards WHERE failures < 4")]
+    lim = int(os.environ.get("WORKDAY_PER_RUN", "120" if SCAN_MODE == "light" else "400"))
+    boards = [(r["host"], r["tenant"], r["site"]) for r in conn.execute(
+        "SELECT host, tenant, site FROM workday_boards WHERE failures < 4 ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (lim,))]
+    stamp = now_utc()
+    conn.executemany("UPDATE workday_boards SET last_polled=? WHERE host=? AND tenant=? AND site=?", [(stamp, *b) for b in boards])
+    conn.commit()
     conn.close()
     print(f"[workday] polling {len(boards)} Workday career sites ...")
     with ThreadPoolExecutor(5) as ex:
@@ -3511,6 +3581,145 @@ def resolve_via_site(company: str, title: str, rules: dict | None = None) -> tup
     return result
 
 
+_URL_LEVELS = {"senior", "sr", "staff", "principal", "lead", "architect", "manager", "director", "head", "intern", "internship",
+               "trainee", "vp", "advisor"}
+
+
+def _url_level_conflict(title: str, url: str) -> bool:
+    """The company link names a seniority the role's title doesn't ('Tech-Lead-…' for 'Software Development Engineer')."""
+    path = set(re.split(r"[^a-z]+", urllib.parse.urlparse(url or "").path.lower()))
+    have = set(re.split(r"[^a-z]+", (title or "").lower()))
+    return bool((path & _URL_LEVELS) - have)
+
+
+def _same_title(want: str, got: str, ratio: float = 0.9) -> bool:
+    """Same role: identical seniority tokens and ≥90% similar normalised title."""
+    import difflib
+    a, b = _norm_title(want), _norm_title(got)
+    if not a or not b or set(_LEVEL_TOKENS.findall(a)) != set(_LEVEL_TOKENS.findall(b)):
+        return False
+    return a == b or difflib.SequenceMatcher(None, a, b).ratio() >= ratio
+
+
+def resolve_workday(company: str, title: str, rules: dict | None = None) -> tuple[str, str] | None:
+    """Big companies (Accenture, Citi, PayPal …) post LinkedIn roles from Workday: search their Workday site for the title."""
+    cands = set(_slug_candidates(company))
+    if not cands:
+        return None
+    conn = get_db()
+    try:
+        boards = [(r["host"], r["tenant"], r["site"]) for r in conn.execute("SELECT host, tenant, site FROM workday_boards WHERE failures < 4")
+                  if r["tenant"].lower() in cands or any(len(c) >= 5 and r["tenant"].lower().startswith(c) for c in cands)]
+    finally:
+        conn.close()
+    for host, tenant, site in boards[:3]:
+        d = http_post(f"https://{host}/wday/cxs/{tenant}/{site}/jobs",
+                      {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": title[:80]}, timeout=20, extra_headers=_WD_HEADERS)
+        hits = [(j.get("title", ""), j.get("externalPath", ""), j.get("locationsText", "")) for j in (d or {}).get("jobPostings") or []] \
+            if isinstance(d, dict) else []
+        ok = [(t, pth, loc) for t, pth, loc in hits if pth and _same_title(title, t)]
+        if ok:
+            good = [o for o in ok if not rules or location_ok(o[2], rules)[0]]
+            t, pth, loc = (good or ok)[0]
+            return f"https://{host}/{site}{pth}", ("" if re.match(r"\d+\s+locations", loc or "", re.I) else loc)
+    return None
+
+
+def resolve_bigco(company: str, title: str, rules: dict | None = None) -> tuple[str, str] | None:
+    """Companies with their own public job API (no ATS board): Amazon / AWS."""
+    key = _company_key(company)
+    if not (key.startswith("amazon") or key in ("aws", "amazonwebservices", "amazondevelopmentcentre")):
+        return None
+    d = http_get("https://www.amazon.jobs/en/search.json?" + urllib.parse.urlencode(
+        {"base_query": title[:100], "loc_query": "India", "result_limit": 20}), timeout=20, quiet=True)
+    for j in (d or {}).get("jobs", []) if isinstance(d, dict) else []:
+        if j.get("job_path") and _same_title(title, j.get("title", "")):
+            url = "https://www.amazon.jobs" + j["job_path"]
+            try:
+                _POSTED_CACHE[url] = datetime.strptime(re.sub(r"\s+", " ", j.get("posted_date", "")).strip(), "%B %d, %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+            return url, j.get("location", "")
+    return None
+
+
+SERPER_RESOLVE_PER_DAY = int(os.environ.get("SERPER_RESOLVE_PER_DAY", "40"))
+_JOB_SITE_NOISE = ("linkedin.", "indeed.", "glassdoor.", "naukri.", "foundit.", "monster", "shine.com", "timesjobs.", "iimjobs.",
+                   "hirist.", "instahyre.", "cutshort.", "wellfound.", "angel.co", "ziprecruiter.", "simplyhired.", "jooble.",
+                   "talent.com", "startup.jobs", "sorce.jobs", "jobspri.", "huntyourtribe.", "builtin.", "ambitionbox.", "apna.co",
+                   "workindia.", "freshersworld.", "jobsora.", "careerjet.", "adzuna.", "jobrapido.", "whatjobs.", "jobleads.",
+                   "trabajo.", "learn4good.", "teal", "remoterocketship.", "himalayas.", "remoteok.", "weworkremotely.",
+                   "dice.com", "levels.fyi", "6figr.", "facebook.com", "x.com", "twitter.com", "youtube.", "medium.com",
+                   "saarthilms.", "jobaaj.", "jobsearch", "jobkart", "jobstreet", "jobs.ac", "jobicy.", "wayup.", "otta.", "welcometothejungle.", "jobgether.", "remotive.")
+_CAREER_HOST = re.compile(r"myworkdayjobs\.com|myworkdaysite\.com|greenhouse\.io|lever\.co|ashbyhq\.com|smartrecruiters\.com|workable\.com|"
+                          r"icims\.com|successfactors\.|jobs\.sap\.com|oraclecloud\.com|taleo\.net|jobvite\.com|darwinbox\.|keka\.com|"
+                          r"zohorecruit\.|freshteam\.com|recruitee\.com|bamboohr\.com|teamtailor\.com|breezy\.hr|rippling\.com|"
+                          r"eightfold\.ai|phenompeople\.com|avature\.net|amazon\.jobs", re.I)
+
+
+def resolve_by_search(company: str, title: str, rules: dict | None = None) -> tuple[str, str] | None:
+    """Last resort for a LinkedIn role: one Google search (Serper) for the exact title + company, keep only the
+    company's own careers / ATS page whose text really shows this role. Capped per day; cached for 30 days."""
+    if not SERPER_API_KEY:
+        return None
+    ck = f"res:{_company_key(company)}:{_norm_title(title)}"[:200]
+    try:
+        cached = _kv_get(ck)
+    except Exception:
+        cached = ""
+    if cached:
+        try:
+            c = json.loads(cached)
+            if (days_ago(c.get("at", "")) or 0) < 30:
+                return (c["url"], c.get("loc", "")) if c.get("url") else None
+        except ValueError:
+            pass
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _RESOLVE_LOCK:
+        used = int(_kv_get(f"serper_resolve:{day}") or 0)
+        if used >= SERPER_RESOLVE_PER_DAY:
+            return None
+        _kv_set(f"serper_resolve:{day}", str(used + 1))
+    links: list[str] = []
+    try:
+        req = urllib.request.Request("https://google.serper.dev/search", method="POST",
+                                     data=json.dumps({"q": f'"{title}" "{company}" careers apply'}).encode(),
+                                     headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            links = [x.get("link", "") for x in json.loads(r.read().decode()).get("organic", [])]
+    except Exception as exc:
+        print(f"  [resolve-search ✗] {str(exc)[:80]}")
+    keys = [k for k in _slug_candidates(company) if len(k) >= 3]
+    found = None
+    for u in links[:10]:
+        h = _netloc(u)
+        if not u.startswith("http") or is_aggregator(u) or any(n in h for n in _JOB_SITE_NOISE) or bad_apply_target(u):
+            continue
+        flat = re.sub(r"[^a-z0-9]+", "", u.lower())
+        own = any(k.replace("-", "") in re.sub(r"[^a-z0-9]+", "", h) for k in keys)
+        if not _CAREER_HOST.search(u) and not (own and re.search(r"career|jobs?\b|join|hiring|opening|position|vacanc", u, re.I)):
+            continue                                              # a known ATS, or the company's OWN site's careers page
+        txt = _posting_text(u)
+        if not txt or len(txt) < 300:
+            continue
+        low = re.sub(r"[^a-z0-9]+", "", txt.lower())
+        if not any(k.replace("-", "") in flat or k.replace("-", "") in low for k in keys):
+            continue                                              # page must belong to this company
+        if _norm_title(title).replace(" ", "") not in re.sub(r"[^a-z0-9]+", "", _norm_title(txt[:4000])) and \
+                not _same_title(title, txt.split("\n", 1)[0][:120]):
+            continue                                              # and show this exact role
+        found = (u, "")
+        break
+    try:
+        _kv_set(ck, json.dumps({"url": found[0] if found else "", "at": now_utc()}))
+    except Exception:
+        pass
+    return found
+
+
+_RESOLVE_LOCK = threading.Lock()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  FULL-JD VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3651,6 +3860,8 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
             direct = final                                    # e.g. Working Nomads /job/go/<id> redirect
         if not direct and links:
             direct = pick_apply_from_links(links, url)
+        if direct and _url_level_conflict(job.get("title", ""), direct):
+            direct = None                                     # link points at a different (senior / intern) role
         if direct and not bad_apply_target(direct):
             st2, *_ = check_page(direct)
             if st2 == "dead":
@@ -3696,7 +3907,12 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     apply_email = ""
     if link_type == "board":
         # third-party board page: only keep the role if we can reach the company's own posting, or the JD says "email us"
-        res = resolve_direct(job["company"], job["title"], rules) or resolve_via_site(job["company"], job["title"], rules)
+        res = resolve_direct(job["company"], job["title"], rules) or resolve_workday(job["company"], job["title"], rules) or \
+            resolve_bigco(job["company"], job["title"], rules) or resolve_via_site(job["company"], job["title"], rules)
+        if not res and "linkedin.com/jobs" in job["direct_apply_url"]:
+            res = resolve_by_search(job["company"], job["title"], rules)
+        if res and _url_level_conflict(job["title"], res[0]):
+            res = None
         if res:
             direct2, ats_loc = res
             ptxt = _posting_text(direct2)
@@ -3729,6 +3945,8 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     job["match_reason"] = (f"JD read ({len(jd):,} chars) · {stack} · exp: {info['exp']}"
                            + (f" · via {job['board']}" if job.get("board") else ""))
     opened = posting_date(url, job.get("posted_date", "") or job.get("date", ""), src)
+    if not opened and src == "linkedin_jobs" and board_url:      # company page has no date → LinkedIn's own listing date
+        opened = (job.get("posted_date", "") or job.get("date", ""))[:10]
     max_days = rules.get("freshness", {}).get("max_age_days", 40)
     if not opened:
         return None, "opening date could not be verified"
@@ -4297,11 +4515,12 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             collect_workday,             # Workday career sites (public JSON API, full JD)
             collect_huntyourtribe, collect_urbanodx, collect_jsguru,
             collect_remoteok, collect_remotive, collect_himalayas, collect_jobicy, collect_weworkremotely,
+            collect_linkedin_jobs,       # LinkedIn search → the company's own careers page (light: last 24 h only)
         ]
         if SCAN_MODE == "full":
             collectors += [
                 collect_company_careers,     # grows the ATS board list + finds roles on career pages (browser)
-                collect_matcha, collect_hn_jobs, collect_linkedin_jobs, collect_working_nomads, collect_arbeitnow,
+                collect_matcha, collect_hn_jobs, collect_working_nomads, collect_arbeitnow,
                 collect_firecrawl_global, collect_career_pages,
             ]
 
@@ -5874,6 +6093,7 @@ function srcClass(src){
 
 function switchTab(t){
   tab=t;
+  try{ localStorage.setItem('jh_tab',t); if(location.hash!=='#'+t) history.replaceState(null,'','#'+t); }catch(e){}
   ['jobs','posts','startups'].forEach(x=>{
     document.getElementById('panel'+x[0].toUpperCase()+x.slice(1)).style.display = x===t?'':'none';
     document.getElementById('tab'+x[0].toUpperCase()+x.slice(1)).className='tab'+(x===t?' active':'');
@@ -6194,6 +6414,8 @@ async function triggerAutoScan(){
   watchScan();
 }
 
+{ let t0=''; try{ t0=(location.hash||'').slice(1)||localStorage.getItem('jh_tab')||''; }catch(e){}
+  if(['jobs','posts','startups'].includes(t0)) switchTab(t0); }      // a refresh stays on the tab you were on
 refresh();
 pollScan().then(r=>{ if(r) watchScan(); });
 setInterval(()=>{ if(!scanTimer) refresh(); }, 60000);   // auto-refresh so new jobs show up without a reload
