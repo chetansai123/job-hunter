@@ -1027,6 +1027,8 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
     # Java rule (user, 2026-11-26): plain Java is fine, but NOT Java full-stack roles and NOT anything Spring-based.
     if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack[\s\-–(:/,]*java\b|java\s*(?:/|\+|&|and)\s*react|react\s*(?:/|\+|&|and)\s*java", t):
         return False, "Java full-stack role (Spring-based — not your stack)", {}
+    if re.search(r"\bgolang\b|\(\s*go\b|\bgo\s*(?:&|/|\+|,|and\b|developer|engineer|lang\b|backend)|\b(?:in|with)\s+go\b", t):
+        return False, "Go role (not your stack)", {}
     if re.search(r"\bjava\b", full) and re.search(r"\bspring\b|springboot|hibernate|\bj2ee\b|\bjsp\b|\bstruts\b|\bjpa\b", full):
         return False, "Java + Spring / Hibernate in the JD", {}
     if re.search(r"\bjava\b", t) and re.search(r"micro-?services?", full):
@@ -3313,7 +3315,8 @@ def collect_workday(rules: dict) -> list[dict]:
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 _BAD_MAIL = ("noreply", "no-reply", "donotreply", "do-not-reply", "privacy@", "legal@", "abuse@", "press@",
              "support@", "billing@", "sales@", "example.", "sentry", "unsubscribe", "webmaster@", "notifications@",
-             "accessibility@", "dpo@", "security@", "compliance@")
+             "accessibility@", "dpo@", "security@", "compliance@", "applyassistance", "accommodation", "reasonableaccommodation",
+             "disability", "talentacquisitionhelp", "candidatesupport", "recruitingsupport")
 _MAIL_CTX = re.compile(r"apply|send|e-?mail|mail|resume|r[eé]sum[eé]|\bcv\b|reach|contact|submit|application|"
                        r"interested|share|drop|write to|forward|hiring|careers?|jobs?", re.I)
 
