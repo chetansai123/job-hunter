@@ -4706,8 +4706,9 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn = get_db()
         cut = 0
         for r in conn.execute("SELECT id, experience_req, title FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
-            if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack[\s\-–(:/,]*java\b", (r["title"] or "").lower()):
-                conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))      # Java full-stack titles — never your stack
+            if re.search(r"java\s*(?:/|\+|&|and)?\s*(?:react\s*)?full[\s-]?stack|java\s*fullstack|full[\s-]?stack[\s\-–(:/,]*java\b", (r["title"] or "").lower()) or \
+                    re.search(r"\bgolang\b|\(\s*go\b|\bgo\s*(?:&|/|\+|,|and\b|developer|engineer|lang\b|backend)", (r["title"] or "").lower()):
+                conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))      # Java full-stack / Go titles — never your stack
                 cut += 1
                 continue
             mm = re.match(r"\s*(\d+)", r["experience_req"] or "")
