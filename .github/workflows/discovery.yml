@@ -72,12 +72,16 @@ jobs:
         run: python job_hunter.py --init-db
 
       - name: Scan (${{ env.MODE }})
+        id: scan
+        timeout-minutes: 50            # a slow scan stops here, so the steps below still save what it found
         run: python -u job_hunter.py --scan --mode "$MODE"
 
       - name: Publish database to the data branch
-        if: success()
+        if: (success() || failure()) && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure')   # also after a timed-out scan
         run: |
           [ -f jobs.db ] || exit 0
+          [ "$(stat -c %s jobs.db)" -gt 100000 ] || { echo "jobs.db too small — not publishing"; exit 1; }
+          python -c "import sqlite3,sys; r=sqlite3.connect('jobs.db').execute('pragma integrity_check').fetchone()[0]; print('db', r); sys.exit(r!='ok')"
           rm -rf /tmp/pub && mkdir /tmp/pub && cp jobs.db /tmp/pub/
           cd /tmp/pub
           git init -q -b data
@@ -89,7 +93,7 @@ jobs:
           echo "published $(du -h jobs.db | cut -f1)"
 
       - name: Build the dashboard and publish it to the site branch (GitHub Pages serves it)
-        if: success()
+        if: (success() || failure()) && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure')
         run: |
           [ -n "$DASH_PASSWORD" ] && pip install --quiet cryptography
           python job_hunter.py --export-static /tmp/site

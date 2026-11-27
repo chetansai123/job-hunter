@@ -274,6 +274,9 @@ def init_db() -> None:
             failures     INTEGER DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS board_urls (
+            url TEXT PRIMARY KEY, board TEXT, first_seen TEXT
+        );
         CREATE TABLE IF NOT EXISTS workday_boards (
             host     TEXT NOT NULL,
             tenant   TEXT NOT NULL,
@@ -797,6 +800,8 @@ def location_ok(loc: str, rules: dict, jd: str | None = None) -> tuple[bool, str
         return True, "ok"
     L = rules.get("locations", {})
     has_india = "india" in l or bool(re.search(r"(?:^|[,\s(/-])(?:in|ind)\s*\)?$", l)) or any(_has(p, l) for p in L.get("india_places", []))
+    if has_india and re.fullmatch(r"[a-z .'-]+,\s*in", l) and not any(_has(p, l) for p in L.get("india_places", [])):
+        return False, f"Location not India-eligible: {loc} (Indiana, US)"     # "Carmel, IN" is a US state code
     if any(_has(p, l) for p in L.get("non_india_places", [])) and "india" not in l and not re.search(r"worldwide|anywhere in the world", l):
         return False, f"Location not India-eligible: {loc}"
     if has_india:
@@ -822,7 +827,11 @@ _GEO_RESTRICT = re.compile(
     r"(?:based|located)\s+in\s+(?:the\s+)?" + _REGION + r"\b|"
     r"(?:remote|home[- ]?based)\s*(?:position\s*)?(?:available\s+)?(?:in|within|-|–)\s*(?:the\s+)?" + _REGION + r"\b|"
     r"\b(?:est|pst|cst|cet|edt|pdt)\s+(?:time\s*zone|hours)|" + r"\b(?:us|european|eu|uk|north american)\s+time\s*zones?\b|"
-    r"(?:not\s+(?:open|available)\s+to\s+(?:candidates\s+)?(?:in|from)\s+india|excluding\s+india)", re.I)
+    r"(?:not\s+(?:open|available)\s+to\s+(?:candidates\s+)?(?:in|from)\s+india|excluding\s+india)|"
+    r"(?:authori[sz]ed|eligible|authori[sz]ation)\s+to\s+work\s+in\s+(?:the\s+)?" + _REGION + r"\b|"
+    r"\b(?:us|u\.s\.)\s+citizen(?:ship)?\b|security\s+clearance|"
+    r"remote\s*\(\s*(?:the\s+)?" + _REGION + r"\b|" + _REGION + r"\s+only\b|only\s+(?:open\s+to\s+)?(?:candidates\s+)?(?:in|from)\s+(?:the\s+)?" + _REGION + r"\b|"
+    r"\b(?:et|ct|pt|mt|eastern|central|pacific|mountain)(?:\s*/\s*(?:et|ct|pt|mt))*\s+time\s*zones?\b", re.I)
 
 
 def passes_hard_filters(title: str, company: str, url: str, body: str, rules: dict) -> tuple[bool, str]:
@@ -1002,8 +1011,11 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
     if p:
         return False, f"Staffing/agency post ('{p}')", {}
 
-    # seniority hidden in the body ("We are seeking a highly skilled Senior Software Engineer…")
-    m = re.search(r"(?:seeking|looking for|hiring|need)\s+(?:an?\s+)?(?:[\w,\- ]{0,40}?)\b(senior|sr\.?|staff|principal|lead)\s+"
+    # seniority hidden in the body ("We are seeking a highly skilled Senior Software Engineer…") — unless the JD
+    # itself asks for 3 years or less (many "Software Engineer II / 3+ yrs" posts still say "senior" somewhere)
+    _stated = parse_experience(jd or "")
+    _low_min = any(1 <= s[0] <= E.get("max_min_years", 3) for s in _stated) and min(s[0] for s in _stated) <= E.get("max_min_years", 3)
+    m = None if _low_min else re.search(r"(?:seeking|looking for|hiring|need)\s+(?:an?\s+)?(?:[\w,\- ]{0,40}?)\b(senior|sr\.?|staff|principal|lead)\s+"
                   r"(?:software|full|back|front|web|engineer|developer)", b[:1500])
     if m:
         return False, f"Senior role in JD body ('{m.group(1)}')", {}
@@ -1011,7 +1023,9 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
     ok, reason = location_ok(location, rules, jd or "")
     if not ok:
         return False, reason, {}
-    if _GEO_RESTRICT.search(jd or "") and not re.search(r"india|worldwide|anywhere in the world|apac|asia", b[:6000]):
+    _loc_india = bool(re.search(r"india|bengaluru|bangalore|hyderabad|pune|chennai|mumbai|gurgaon|gurugram|noida|delhi|kolkata|"
+                                r"ahmedabad|kochi|jaipur|indore|coimbatore|mohali|chandigarh|trivandrum", (location or "").lower()))
+    if not _loc_india and _GEO_RESTRICT.search(jd or "") and not re.search(r"india|worldwide|anywhere in the world|apac|asia", b[:6000]):
         return False, "JD restricts hiring to a non-India region", {}
 
     # ── stack: ANY core term is enough; wrong-stack dominated JDs are rejected ──
@@ -1050,7 +1064,9 @@ def analyze_jd(title: str, company: str, jd: str, rules: dict,
     core_occ = _occurrences(_js_core, b) + (core_occ - _occurrences(S.get("core", []), b) if False else 0)
     if b_title and b_occ >= core_occ and not (core_title and b_occ < 2):
         return False, f"Framework outside your stack in title ('{b_title[0]}')", {}
-    if not core_title and ((b_occ >= 2 and b_occ >= core_occ) or (b_occ >= 1 and core_occ == 0)):
+    # one passing mention ("e.g., Java, C, C++") in a Python / plain-Java JD is not a stack mismatch
+    _lone = b_occ == 1 and _occurrences(["python", "java", "fastapi"], b) >= 2 and not re.search(r"django|flask|spring|hibernate", b)
+    if not core_title and not _lone and ((b_occ >= 2 and b_occ >= core_occ) or (b_occ >= 1 and core_occ == 0)):
         return False, f"JD built on a stack outside yours ({', '.join(_hits(blocked, b)[:2])})", {}
 
     # ── experience: the JD's MINIMUM must be <= 3 ──
@@ -1125,6 +1141,14 @@ def _is_valid_poster(text: str) -> bool:
 
 # ─────────────────────────── DB insert ──────────────────────────────────────
 
+_REQ_RE = re.compile(r"[_/-](R-?\d{5,}|JR-?\d{4,}|REQ-?\d{4,})(?:[-_/?#]|$)|applytojob\.com/apply/([A-Za-z0-9]{8,})", re.I)
+
+
+def _req_id(url: str) -> str:
+    m = _REQ_RE.search(url or "")
+    return (m.group(1) or m.group(2)) if m else ""
+
+
 def insert_job(conn: sqlite3.Connection, job: dict) -> bool:
     """A job is 'already seen' only if its EXACT apply URL was shown before (persisted forever)."""
     nu = norm_url(job["direct_apply_url"])
@@ -1133,6 +1157,12 @@ def insert_job(conn: sqlite3.Connection, job: dict) -> bool:
         return False
     if conn.execute("SELECT id FROM jobs WHERE job_hash=?", (h,)).fetchone():
         return False
+    rid = _req_id(job["direct_apply_url"])
+    if rid:
+        ck = _company_key(job["company"])
+        for r in conn.execute("SELECT company FROM jobs WHERE direct_apply_url LIKE ?", (f"%{rid}%",)):
+            if _company_key(r["company"]) == ck:
+                return False                   # same requisition already listed (another mirror of the company's site)
     conn.execute("""
         INSERT INTO jobs (
             job_hash,company,title,direct_apply_url,discovery_source,
@@ -2275,15 +2305,19 @@ def collect_linkedin_jobs(rules: dict) -> list[dict]:
                        h or "", re.S)
         if pm:
             poster = {"url": pm.group(1).replace("in.linkedin.com", "www.linkedin.com"), "name": htmllib.unescape(pm.group(2)).strip()}
-        return c, jd, poster
+        offsite = "offsite-apply" in (h or "")              # "Apply on company website" (vs Easy Apply inside LinkedIn)
+        return c, jd, poster, offsite
     with ThreadPoolExecutor(3) as ex:
-        for (jid, title, comp, loc, date), jd, poster in ex.map(detail, cards):
+        for (jid, title, comp, loc, date), jd, poster, offsite in ex.map(detail, cards):
             if len(jd) < 200:
                 continue
             j = _job(comp, title, f"https://www.linkedin.com/jobs/view/{jid}", "linkedin_jobs", rules,
-                     location=loc, date=date, jd_text=jd, board="LinkedIn", reason="LinkedIn Jobs")
+                     location=loc, date=date, jd_text=jd, board="LinkedIn",
+                     reason="LinkedIn Jobs · apply on company site" if offsite else "LinkedIn Jobs · Easy Apply")
             j["li_poster"] = poster
+            j["li_offsite"] = offsite
             out.append(j)
+    out.sort(key=lambda j: not j.get("li_offsite"))         # company-site roles first: they are the ones we can link
     print(f"[linkedin-jobs] {len(cards)} cards → {len(out)} with full JD")
     return out
 
@@ -3037,6 +3071,50 @@ def register_board(conn: sqlite3.Connection, url: str, source: str = "") -> None
         pass
 
 
+_BOARD_SEEN: dict[str, str] = {}          # url → first time we saw it on its board ('' = it was there on the board's first poll)
+_BOARD_KNOWN: set[str] = set()            # boards polled at least once since first-seen tracking began
+_BOARD_SEEN_NEW: list[tuple[str, str, str]] = []
+_BOARD_SEEN_LOADED = [False]
+_FIRST_SEEN: dict[str, str] = {}          # norm url → YYYY-MM-DD, used by verify_candidate when the job system gives no date
+
+
+def _load_board_seen() -> None:
+    if _BOARD_SEEN_LOADED[0]:
+        return
+    conn = get_db()
+    try:
+        for r in conn.execute("SELECT url, board, first_seen FROM board_urls"):
+            if r["url"].startswith("board:"):
+                _BOARD_KNOWN.add(r["board"])
+            else:
+                _BOARD_SEEN[r["url"]] = r["first_seen"] or ""
+    finally:
+        conn.close()
+    _BOARD_SEEN_LOADED[0] = True
+
+
+def _first_seen(board: str, url: str) -> str:
+    """Date a job first appeared on a board we were already watching — for job systems that publish no date.
+    On a board's first poll every job is 'already there' (unknown age) and gets no date."""
+    nu = norm_url(url)
+    with _BOARD_RESULTS_LOCK:
+        if nu not in _BOARD_SEEN:
+            first = now_utc() if board in _BOARD_KNOWN else ""
+            _BOARD_SEEN[nu] = first
+            _BOARD_SEEN_NEW.append((nu, board, first))
+        d = (_BOARD_SEEN[nu] or "")[:10]
+    if d:
+        _FIRST_SEEN[nu] = d
+    return d
+
+
+def _board_watched(board: str) -> None:
+    with _BOARD_RESULTS_LOCK:
+        if board not in _BOARD_KNOWN:
+            _BOARD_KNOWN.add(board)
+            _BOARD_SEEN_NEW.append(("board:" + board, board, now_utc()))
+
+
 _BOARD_RESULTS: list[tuple[str, str, bool]] = []
 _BOARD_RESULTS_LOCK = threading.Lock()
 
@@ -3051,10 +3129,12 @@ def _board_failed(kind: str, token: str, failed: bool) -> None:
 def _flush_board_results() -> None:
     with _BOARD_RESULTS_LOCK:
         rows, _BOARD_RESULTS[:] = list(_BOARD_RESULTS), []
-    if not rows:
+        seen, _BOARD_SEEN_NEW[:] = list(_BOARD_SEEN_NEW), []
+    if not rows and not seen:
         return
     conn = get_db()
     try:
+        conn.executemany("INSERT OR IGNORE INTO board_urls (url, board, first_seen) VALUES (?,?,?)", seen)
         conn.executemany("UPDATE ats_boards SET failures=failures+1 WHERE kind=? AND token=?", [(k, t) for k, t, f in rows if f])
         conn.executemany("UPDATE ats_boards SET failures=0 WHERE kind=? AND token=?", [(k, t) for k, t, f in rows if not f])
         conn.commit()
@@ -3074,7 +3154,10 @@ def _prefilter(title: str, company: str, url: str, loc: str, rules: dict) -> boo
 def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
     """One board's matching roles; a broken board never takes the whole rotation down."""
     try:
-        return _fetch_board_inner(board, rules)
+        out = _fetch_board_inner(board, rules)
+        if board[0] in ("zoho",) or board[0] in _XS_KINDS:
+            _board_watched(f"{board[0]}:{board[1]}")
+        return out
     except Exception as exc:
         print(f"  [board ✗] {board[0]}:{board[1][:40]}: {exc}")
         _board_failed(board[0], board[1], True)
@@ -3121,8 +3204,10 @@ def _fetch_board_inner(board: tuple[str, str], rules: dict) -> list[dict]:
         for j in jobs or []:
             if not j["url"] or not _prefilter(j["title"], company, j["url"], j["location"], rules) or not _fresh_enough(j["date"], rules):
                 continue
-            if not j["date"]:              # many Zoho boards publish no date at all → it could never pass the 40-day rule;
-                continue                   # skip it here instead of spending a full-JD read on it
+            if not j["date"]:              # many Zoho boards publish no date at all → date = first seen on a board we already watch
+                j["date"] = _first_seen(f"{kind}:{token}", j["url"])
+                if not j["date"]:
+                    continue               # was already listed when we started watching: age unknown, skip
             _POSTED_CACHE[j["url"]] = j["date"]          # the job system's own publish date (Keka publishedOn / Zoho Date_Opened)
             out.append(_job(company.split(".")[0], j["title"], j["url"], f"ats:{kind}", rules, location=j["location"], date=j["date"],
                             jd_text=(j["jd"] + (f"\nExperience: {j['exp']}" if j["exp"] else "")), reason=f"{kind.title()} · {token}"))
@@ -3180,6 +3265,8 @@ def _xs_jobs(kind: str, token: str, rows: list[dict], rules: dict, source: str =
         if not url or is_aggregator(url) or not _prefilter(title, company, url, loc, rules):
             continue
         posted = r.get("posted_date") or ""
+        if not posted and not source:                          # per-company board without dates → first seen
+            posted = _first_seen(f"{kind}:{token}", url)
         if posted and not _fresh_enough(posted, rules):
             continue
         if posted:
@@ -3291,6 +3378,7 @@ def import_token_pack(conn: sqlite3.Connection) -> int:
 
 def collect_ats_boards(rules: dict) -> list[dict]:
     """Polls company boards in rotation (least recently polled first) so the list can grow to thousands."""
+    _load_board_seen()
     conn = get_db()
     if _due("board_datasets_at", 24 * 7):
         try:
@@ -4027,10 +4115,13 @@ def posting_date(url: str, hint: str = "", source: str = "") -> str:
             if mm:
                 d = mm.group(1)
             else:
-                ago = re.search(r"posted\s+(\d+)\s+days?\s+ago", h, re.I)
+                hx = re.sub(r"<!--.*?-->", "", h)
+                ago = re.search(r"posted\s*:?\s*(\d+)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mo)\s+ago", hx, re.I)
                 if ago:
-                    d = (datetime.now(timezone.utc) - timedelta(days=int(ago.group(1)))).strftime("%Y-%m-%d")
-                elif re.search(r"posted\s+(?:today|yesterday|just now|\d+\s+hours?\s+ago)", h, re.I):
+                    n, u = int(ago.group(1)), ago.group(2).lower()
+                    days = 0 if u[0] in "mh" and not u.startswith("mo") else 7 * n if u[0] == "w" else 30 * n if u.startswith("mo") else n
+                    d = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+                elif re.search(r"posted\s+(?:today|yesterday|just now|\d+\s+hours?\s+ago)", hx, re.I):
                     d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         d = ""
@@ -4077,6 +4168,8 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     if len(jd) < 300 and job.get("jd_api"):
         d = http_get(job["jd_api"], timeout=25)
         txt = d.get("content", "") if isinstance(d, dict) else ""
+        if isinstance(d, dict) and d.get("first_published"):
+            _POSTED_CACHE.setdefault(url, d["first_published"][:10])
         if txt:
             jd = _html_to_text(htmllib.unescape(txt))
     if len(jd) < 300 or job.get("need_fetch"):
@@ -4148,8 +4241,8 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
         # third-party board page: only keep the role if we can reach the company's own posting, or the JD says "email us"
         res = resolve_direct(job["company"], job["title"], rules) or resolve_workday(job["company"], job["title"], rules) or \
             resolve_bigco(job["company"], job["title"], rules) or resolve_via_site(job["company"], job["title"], rules)
-        if not res and "linkedin.com/jobs" in job["direct_apply_url"]:
-            res = resolve_by_search(job["company"], job["title"], rules)
+        if not res and "linkedin.com/jobs" in job["direct_apply_url"] and job.get("li_offsite", True):
+            res = resolve_by_search(job["company"], job["title"], rules)    # paid search only for "apply on company site" roles
         if res and _url_level_conflict(job["title"], res[0]):
             res = None
         if res:
@@ -4184,8 +4277,14 @@ def verify_candidate(job: dict, rules: dict) -> tuple[dict | None, str]:
     job["match_reason"] = (f"JD read ({len(jd):,} chars) · {stack} · exp: {info['exp']}"
                            + (f" · via {job['board']}" if job.get("board") else ""))
     opened = posting_date(url, job.get("posted_date", "") or job.get("date", ""), src)
-    if not opened and src == "linkedin_jobs" and board_url:      # company page has no date → LinkedIn's own listing date
-        opened = (job.get("posted_date", "") or job.get("date", ""))[:10]
+    if not opened and job.get("jd_api") and "greenhouse.io" in job["jd_api"]:   # company-domain Greenhouse page (?gh_jid=)
+        gj = http_get(job["jd_api"], timeout=15, quiet=True)
+        opened = ((gj.get("first_published") or "") if isinstance(gj, dict) else "")[:10]
+    if not opened and board_url:                                 # company page has no date → the board's own listing date
+        opened = (job.get("posted_date", "") or job.get("date", ""))[:10] if src == "linkedin_jobs" else \
+            posting_date(board_url, job.get("posted_date", ""), src)
+    if not opened and _FIRST_SEEN.get(job.get("_nu") or norm_url(url)):    # first appeared on a board we already watched
+        opened = _FIRST_SEEN[job.get("_nu") or norm_url(url)]
     max_days = rules.get("freshness", {}).get("max_age_days", 40)
     if not opened:
         return None, "opening date could not be verified"
@@ -4347,9 +4446,15 @@ def build_contacts(conn: sqlite3.Connection, company: str, use_search: bool = Tr
 #  RE-VETTING STORED RESULTS  (still live? still passes every rule? direct link found?)
 # ═══════════════════════════════════════════════════════════════════════════
 
+_COMPANY_ALIASES = {"aws": "amazon", "amazonwebservices": "amazon", "amazonwebservicesaws": "amazon", "amazonlab126": "amazon",
+                    "lab126": "amazon", "amazondevelopmentcentre": "amazon", "amazondevelopmentcenter": "amazon"}
+
+
 def _company_key(name: str) -> str:
     words = [w for w in re.sub(r"[^a-z0-9 ]+", " ", (name or "").lower()).split() if w not in _SLUG_STOP]
-    return "".join(words) or re.sub(r"\W+", "", (name or "").lower())
+    k = "".join(words) or re.sub(r"\W+", "", (name or "").lower())
+    k = re.sub(r"(?<=.{3})(?:careers?|jobs|hiring)$", "", k)            # "Bjakcareer" (board token) = "Bjak"
+    return _COMPANY_ALIASES.get(k, "amazon" if k.startswith("amazon") else k)
 
 
 MAX_ROLES_PER_COMPANY = int(os.environ.get("MAX_ROLES_PER_COMPANY", "2"))
@@ -4369,7 +4474,13 @@ def enforce_company_cap(conn: sqlite3.Connection, cap: int = MAX_ROLES_PER_COMPA
         for r in rs[cap:]:
             if r["status"] in ("saved", "applied"):
                 continue
+            u = conn.execute("SELECT direct_apply_url FROM jobs WHERE id=?", (r["id"],)).fetchone()
             conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
+            if u and u[0]:                     # not 'seen' — it can come back when one of this company's slots frees up
+                nu = norm_url(u[0])
+                conn.execute("DELETE FROM seen_jobs WHERE url=?", (nu,))
+                conn.execute("INSERT OR REPLACE INTO rejected_urls (url, reason, at) VALUES (?,?,?)",
+                             (nu, f"company cap ({cap} shown)", now_utc()))
             removed += 1
     conn.commit()
     return removed
@@ -4431,6 +4542,8 @@ def revet_existing_jobs(rules: dict, limit: int | None = None, stale_hours: floa
         if r["posted_date"] and (days_ago(r["posted_date"]) or 0) > rules.get("freshness", {}).get("max_age_days", 40):
             return r, None, f"stale posting (opened {r['posted_date']})"
         loc = r["location"] if r["location"] and r["location"] != "Remote / not stated" else ""
+        if r["posted_date"]:                       # verified when it was stored (job systems whose page has no date)
+            _POSTED_CACHE.setdefault(r["direct_apply_url"], r["posted_date"][:10])
         j = _job(r["company"], r["title"], r["direct_apply_url"], "revet", rules, location=loc, need_fetch=True,
                  salary=r["salary"], date=r["posted_date"])
         try:
@@ -4658,6 +4771,16 @@ SCAN_STATE: dict = {"running": False, "stage": "", "started": None, "summary": N
 MAX_VERIFY_PER_SCAN = int(os.environ.get("MAX_VERIFY_PER_SCAN", "400"))
 SCAN_MODE = os.environ.get("SCAN_MODE", "full").lower()      # "light" = job APIs only (fast); "full" = + LinkedIn, careers pages, Apify
 REJECT_RECHECK_DAYS = 3
+_TEMP_REJECT = re.compile(r"unreadable|rate limit|could not be verified|board-only|no company link|timed? ?out|company cap|"
+                          r"company pays|company posting|not found \(board|unreachable", re.I)
+
+
+def _recheck_after(reason: str) -> float:
+    """Days before a rejected URL is read again: temporary reasons soon, rule decisions (experience, stack,
+    location, seniority …) after a month — they don't change; a rules change clears the table anyway."""
+    if "unreadable" in reason:
+        return 0.5
+    return REJECT_RECHECK_DAYS if _TEMP_REJECT.search(reason) else 30
 
 
 def _stage(msg: str) -> None:
@@ -4743,6 +4866,12 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.execute("DELETE FROM rejected_urls WHERE reason LIKE 'board-only%' OR (url LIKE '%linkedin.com/jobs%' AND reason LIKE 'opening date%')")
         conn.commit()
         _kv_set("li_resolve_retry", "v1")
+    if _kv_get("reject_fix") != "2026-11-27":            # rules fixed today: give these rejections a fresh read
+        conn.execute("DELETE FROM rejected_urls WHERE reason LIKE 'Senior role in JD body%' OR reason LIKE 'JD restricts hiring%' "
+                     "OR reason LIKE 'JD built on a stack outside yours%' OR reason LIKE 'opening date could not%' "
+                     "OR reason LIKE 'board-only%' OR reason LIKE 'company pays%'")
+        conn.commit()
+        _kv_set("reject_fix", "2026-11-27")
     if _kv_get("token_pack") != _TOKEN_PACK_VERSION and _TOKEN_PACK.exists():   # ~98k public company boards (data/)
         try:
             import_token_pack(conn)
@@ -4802,9 +4931,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             skipped_seen += 1
             continue
         rj = conn.execute("SELECT at, reason FROM rejected_urls WHERE url=?", (nu,)).fetchone()
-        if rj and (days_ago(rj["at"]) or 0) < (0.5 if "unreadable" in (rj["reason"] or "") else REJECT_RECHECK_DAYS):
+        if rj and (days_ago(rj["at"]) or 0) < _recheck_after(rj["reason"] or ""):
             continue
         j["_nu"] = nu
+        j["_recheck"] = bool(rj)
         fresh.append(j)
     try:
         for j in candidates:
@@ -4813,7 +4943,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.commit()
     except Exception as exc:
         print(f"  [!] job-board companies not recorded: {exc}")
-    fresh = _interleave(fresh)
+    fresh = _interleave([j for j in fresh if not j["_recheck"]]) + _interleave([j for j in fresh if j["_recheck"]])
     if len(fresh) > MAX_VERIFY_PER_SCAN:
         print(f"[verify] capping {len(fresh)} → {MAX_VERIFY_PER_SCAN} this scan (rest next scan)")
         fresh = fresh[:MAX_VERIFY_PER_SCAN]
@@ -4864,7 +4994,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             if india and not job.get("salary"):
                 est = company_sde_salary(job["company"])
                 if est is not None and est < SALARY_FLOOR_EST:
-                    rejects[f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})"] = rejects.get(f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})", 0) + 1
+                    why = f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})"
+                    rejects[why] = rejects.get(why, 0) + 1
+                    conn.execute("INSERT OR REPLACE INTO rejected_urls (url, reason, at) VALUES (?,?,?)",
+                                 (norm_url(job["direct_apply_url"]), why, now_utc()))     # don't re-read it every scan
                     continue
                 if est is not None:
                     job["notes"] = (job.get("notes", "") + f" Typical SDE pay at {job['company']}: ~{est} LPA (from search results).").strip()
@@ -4928,9 +5061,9 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
     _stage("re-checking stored jobs")
     try:
-        if _kv_get("jobs_rejudged") != "v-date-java":
+        if _kv_get("jobs_rejudged") != "v-2026-11-27":
             revet_existing_jobs(rules, limit=100000, stale_hours=0)     # every stored job, once, with the new rules
-            _kv_set("jobs_rejudged", "v-date-java")
+            _kv_set("jobs_rejudged", "v-2026-11-27")
         else:
             revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.commit()
@@ -4947,9 +5080,13 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             if mm and int(mm.group(1)) > rules.get("experience", {}).get("max_min_years", 3):
                 conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
                 cut += 1
+        for r in conn.execute("SELECT id, apply_email FROM jobs WHERE IFNULL(apply_email,'')!='' AND status NOT IN ('applied','saved')").fetchall():
+            if any(bm in r["apply_email"].lower() for bm in _BAD_MAIL):
+                conn.execute("DELETE FROM jobs WHERE id=?", (r["id"],))         # accessibility / help-desk address, not an apply e-mail
+                cut += 1
         conn.commit()
         conn.close()
-        print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit")
+        print(f"[prune] removed {cut} stored jobs whose minimum experience is above your limit (or wrong stack / help-desk e-mail)")
         c3 = get_db()
         undated = c3.execute("SELECT id, direct_apply_url, discovery_source, notes FROM jobs WHERE status NOT IN ('applied','saved') "
                              "AND IFNULL(posted_date,'')='' LIMIT 200").fetchall()
@@ -5664,7 +5801,9 @@ def _startup_from_board(name: str, website: str, source: str, info: dict, board:
     return d
 
 
-SALARY_FLOOR_EST = float(os.environ.get("SALARY_FLOOR_EST", "10"))     # typical SDE pay at the company, LPA
+# typical SDE pay at the company, LPA. The estimate is the median of *all-levels* ranges from search snippets, which runs
+# ~3 LPA below what a 2–3 yr engineer actually earns there — so 7 on this scale ≈ the user's "about 10 LPA" rule.
+SALARY_FLOOR_EST = float(os.environ.get("SALARY_FLOOR_EST", "7"))
 
 
 def company_sde_salary(company: str) -> float | None:

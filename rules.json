@@ -119,7 +119,14 @@
       "elixir",
       "perl",
       "delphi",
-      "cobol"
+      "cobol",
+      "ruby on rails",
+      "rails",
+      "ror",
+      "rust",
+      "haskell",
+      "golang",
+      "clojure"
     ],
     "_blocked_note": "Updated 2026-11-25: Python + FastAPI + plain Java (no Spring Boot required) are YOURS now. Spring/Hibernate/J2EE, .NET, PHP, Django, Ruby, Kotlin, C++ etc. stay blocked."
   },
@@ -549,7 +556,9 @@
       "quickhire",
       "carreeroza",
       "hiring solutions",
-      "talent network"
+      "talent network",
+      "neogencode",
+      "hiring so"
     ],
     "body_phrases": [
       "our client",
@@ -573,7 +582,15 @@
       "staffing agency",
       "hiring for one of our",
       "hiring for our client",
-      "leading mnc client"
+      "leading mnc client",
+      "reputed client",
+      "esteemed client",
+      "for a leading client",
+      "for one of our clients",
+      "client of ours",
+      "for a reputed",
+      "our clients are hiring",
+      "hiring for a client"
     ]
   },
   "freshness": {
