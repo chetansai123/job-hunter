@@ -4988,7 +4988,7 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     _stage(f"saving {len(accepted)} jobs")
     if SERPER_API_KEY or TAVILY_API_KEY:
         conn.commit()                                  # pay lookups write to kv on their own connection
-        keep = []
+        keep, pay_rejected = [], []
         for job in accepted:
             india = not re.search(r"remote|worldwide|anywhere", job.get("location", "") or "", re.I) or "india" in (job.get("location", "") or "").lower()
             if india and not job.get("salary"):
@@ -4996,13 +4996,14 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
                 if est is not None and est < SALARY_FLOOR_EST:
                     why = f"company pays ~{int(est)} LPA (below {int(SALARY_FLOOR_EST)})"
                     rejects[why] = rejects.get(why, 0) + 1
-                    conn.execute("INSERT OR REPLACE INTO rejected_urls (url, reason, at) VALUES (?,?,?)",
-                                 (norm_url(job["direct_apply_url"]), why, now_utc()))     # don't re-read it every scan
+                    pay_rejected.append((norm_url(job["direct_apply_url"]), why, now_utc()))   # remembered below
                     continue
                 if est is not None:
                     job["notes"] = (job.get("notes", "") + f" Typical SDE pay at {job['company']}: ~{est} LPA (from search results).").strip()
             keep.append(job)
         accepted = keep
+        conn.executemany("INSERT OR REPLACE INTO rejected_urls (url, reason, at) VALUES (?,?,?)", pay_rejected)  # not re-read every scan
+        conn.commit()
     for job in accepted:
         try:
             company_contacts = build_contacts(conn, job["company"], use_search=contact_searches < 12)
