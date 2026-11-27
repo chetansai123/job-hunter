@@ -44,6 +44,12 @@ from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+try:                                            # extra public job systems (SmartRecruiters, Workable, Oracle, Eightfold, ...)
+    import extra_sources as xs
+except Exception as _xs_exc:                    # never let an optional source module break a scan
+    print(f"[!] extra_sources not loaded: {_xs_exc}")
+    xs = None
+
 # ─────────────────────────── SSL fix ────────────────────────────────────────
 def _setup_ssl() -> None:
     """python.org builds on macOS ship WITHOUT CA certificates, so every HTTPS call
@@ -168,7 +174,7 @@ def load_rules() -> dict:
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=120)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -3031,13 +3037,26 @@ def register_board(conn: sqlite3.Connection, url: str, source: str = "") -> None
         pass
 
 
+_BOARD_RESULTS: list[tuple[str, str, bool]] = []
+_BOARD_RESULTS_LOCK = threading.Lock()
+
+
 def _board_failed(kind: str, token: str, failed: bool) -> None:
+    """Remembered in memory and written in one transaction by _flush_board_results (dozens of threads poll boards;
+    one commit each locked the database)."""
+    with _BOARD_RESULTS_LOCK:
+        _BOARD_RESULTS.append((kind, token, failed))
+
+
+def _flush_board_results() -> None:
+    with _BOARD_RESULTS_LOCK:
+        rows, _BOARD_RESULTS[:] = list(_BOARD_RESULTS), []
+    if not rows:
+        return
     conn = get_db()
     try:
-        if failed:
-            conn.execute("UPDATE ats_boards SET failures=failures+1 WHERE kind=? AND token=?", (kind, token))
-        else:
-            conn.execute("UPDATE ats_boards SET failures=0 WHERE kind=? AND token=?", (kind, token))
+        conn.executemany("UPDATE ats_boards SET failures=failures+1 WHERE kind=? AND token=?", [(k, t) for k, t, f in rows if f])
+        conn.executemany("UPDATE ats_boards SET failures=0 WHERE kind=? AND token=?", [(k, t) for k, t, f in rows if not f])
         conn.commit()
     finally:
         conn.close()
@@ -3053,6 +3072,16 @@ def _prefilter(title: str, company: str, url: str, loc: str, rules: dict) -> boo
 
 
 def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
+    """One board's matching roles; a broken board never takes the whole rotation down."""
+    try:
+        return _fetch_board_inner(board, rules)
+    except Exception as exc:
+        print(f"  [board ✗] {board[0]}:{board[1][:40]}: {exc}")
+        _board_failed(board[0], board[1], True)
+        return []
+
+
+def _fetch_board_inner(board: tuple[str, str], rules: dict) -> list[dict]:
     kind, token = board
     out: list[dict] = []
     max_days = rules.get("freshness", {}).get("max_age_days", 40)
@@ -3092,6 +3121,9 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
         for j in jobs or []:
             if not j["url"] or not _prefilter(j["title"], company, j["url"], j["location"], rules) or not _fresh_enough(j["date"], rules):
                 continue
+            if not j["date"]:              # many Zoho boards publish no date at all → it could never pass the 40-day rule;
+                continue                   # skip it here instead of spending a full-JD read on it
+            _POSTED_CACHE[j["url"]] = j["date"]          # the job system's own publish date (Keka publishedOn / Zoho Date_Opened)
             out.append(_job(company.split(".")[0], j["title"], j["url"], f"ats:{kind}", rules, location=j["location"], date=j["date"],
                             jd_text=(j["jd"] + (f"\nExperience: {j['exp']}" if j["exp"] else "")), reason=f"{kind.title()} · {token}"))
     elif kind == "ashby":
@@ -3112,7 +3144,77 @@ def _fetch_board(board: tuple[str, str], rules: dict) -> list[dict]:
                             date=(j.get("publishedAt") or "")[:10], salary=comp,
                             jd_text=j.get("descriptionPlain") or _html_to_text(j.get("descriptionHtml", "")),
                             reason=f"Ashby · {token}"))
+    elif xs and kind in _XS_KINDS:
+        try:
+            opts = {"title_ok": title_relevant} if kind in ("rippling", "bamboohr") else {}
+            rows = xs.FETCHERS[kind](token, **opts)
+        except Exception as exc:
+            print(f"  [{kind} ✗] {token}: {exc}")
+            rows = []
+        _board_failed(kind, token, not rows)            # no rows (dead board, or no India/remote opening): rests until the monthly retry
+        out = _xs_jobs(kind, token, rows, rules)
     return out
+
+
+_XS_KINDS = (tuple(xs.FAST_KINDS) + ("bamboohr",) + tuple(xs.ENTERPRISE_KINDS)) if xs else ()
+_WD_API = re.compile(r"https?://([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)(/job/[^?#]+)", re.I)
+_GH_URL = re.compile(r"https?://(?:job-boards|boards)(\.eu)?\.greenhouse\.io/([^/]+)/jobs/(\d+)")
+
+
+def _jd_hints(url: str) -> dict:
+    """API endpoints that return the full JD for a Workday / Greenhouse posting link (their pages need a browser)."""
+    if (m := _WD_API.match(url or "")):
+        return {"jd_wd": f"https://{m.group(1)}.{m.group(2)}.myworkdayjobs.com/wday/cxs/{m.group(1)}/{m.group(3)}{m.group(4)}"}
+    if (m := _GH_URL.match(url or "")):
+        return {"jd_api": f"https://boards-api{m.group(1) or ''}.greenhouse.io/v1/boards/{m.group(2)}/jobs/{m.group(3)}"}
+    return {}
+
+
+def _xs_jobs(kind: str, token: str, rows: list[dict], rules: dict, source: str = "") -> list[dict]:
+    """Rows from extra_sources → candidate jobs: title / location / freshness prefilter, the job system's own
+    opening date, and the full JD (detail API) for the few rows that pass."""
+    out = []
+    for r in rows or []:
+        url, title, loc = r.get("url") or "", r.get("title") or "", r.get("location") or ""
+        company = r.get("company") or company_from_url(url)
+        if not url or is_aggregator(url) or not _prefilter(title, company, url, loc, rules):
+            continue
+        posted = r.get("posted_date") or ""
+        if posted and not _fresh_enough(posted, rules):
+            continue
+        if posted:
+            _POSTED_CACHE[url] = posted                    # the job system's own published date
+        jd = r.get("description") or ""
+        if len(jd) < 300:
+            jd = xs.detail_jd(kind, r) or jd
+        out.append(_job(company, title, url, source or f"ats:{kind}", rules, location=loc, date=posted,
+                        jd_text=jd if len(jd) >= 300 else "", reason=f"{kind} · {token.split('|')[0]}", **_jd_hints(url)))
+    return out
+
+
+_POLLED_KINDS = ("greenhouse", "lever", "ashby", "keka", "zoho")
+
+
+def _harvest_tokens(urls: list[str]) -> int:
+    """Every company job link we see names its ATS board → add that board to the rotation (cheapest way to grow)."""
+    if not xs:
+        return 0
+    n = 0
+    conn = get_db()
+    try:
+        for kind, tok in xs.tokens_from_urls(urls):
+            if kind == "workday":
+                host, tenant, site = tok.split("|")
+                n += conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)",
+                                  (host.lower(), tenant.lower(), site, "harvest")).rowcount
+            elif kind in _POLLED_KINDS or kind in _XS_KINDS:
+                t = tok if kind in ("smartrecruiters", "oracle", "eightfold", "phenom", "successfactors", "zoho") else tok.lower()
+                n += conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)",
+                                  (kind, t, "harvest", now_utc())).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return n
 
 
 _DATASET_PAGES = ("https://datahub.io/lastroundai-hiring-data/lastroundai-hiring-data/ats-directory",)
@@ -3161,6 +3263,32 @@ def import_board_datasets(conn: sqlite3.Connection) -> int:
     return n if rows else -1                                   # -1 = download failed → retry next scan
 
 
+_TOKEN_PACK = BASE_DIR / "data" / "board_tokens.json.gz"
+_TOKEN_PACK_VERSION = "2026-11-27"
+_BAD_WD_SITES = {"robots.txt", "en", "es", "fr", "de", "wday", "en-us", "login", "jobs"}
+
+
+def import_token_pack(conn: sqlite3.Connection) -> int:
+    """~98k company boards from public lists (Stapply ats-scrapers, MIT; latmay/ats-career-page-urls, CC BY 4.0),
+    shipped in data/board_tokens.json.gz. Boards whose name says India go to the priority set."""
+    import gzip
+    pack = json.loads(gzip.open(_TOKEN_PACK, "rt").read())
+    india = {(k, t) for k, t in pack.get("india", [])}
+    stamp, n = now_utc(), 0
+    for kind, toks in pack.get("kinds", {}).items():
+        if kind not in _POLLED_KINDS and kind not in _XS_KINDS:
+            continue
+        n += conn.executemany("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)",
+                              [(kind, t, "india-hint" if (kind, t) in india else "dataset", stamp) for t in toks]).rowcount
+    wd = [(h, t, s, "india-hint" if ("workday", f"{h}|{t}|{s}") in india else "dataset")
+          for h, t, s in pack.get("workday", []) if s.lower() not in _BAD_WD_SITES]
+    n += conn.executemany("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)", wd).rowcount
+    conn.execute("DELETE FROM workday_boards WHERE lower(site) IN (%s)" % ",".join("?" * len(_BAD_WD_SITES)), tuple(_BAD_WD_SITES))
+    conn.commit()
+    print(f"[token-pack] {n} new company boards added")
+    return n
+
+
 def collect_ats_boards(rules: dict) -> list[dict]:
     """Polls company boards in rotation (least recently polled first) so the list can grow to thousands."""
     conn = get_db()
@@ -3170,28 +3298,37 @@ def collect_ats_boards(rules: dict) -> list[dict]:
                 _kv_set("board_datasets_at", now_utc())
         except Exception as exc:
             print(f"  [datasets ✗] {exc}")
+    if _due("board_retry_at", 24 * 7):                  # boards that failed / had nothing get one more poll after a month
+        month = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        conn.execute("UPDATE ats_boards SET failures=2 WHERE failures>=3 AND IFNULL(last_polled,'') < ?", (month,))
+        conn.execute("UPDATE workday_boards SET failures=3 WHERE failures>=4 AND IFNULL(last_polled,'') < ?", (month,))
+        conn.commit()                                   # before _kv_set opens its own connection (else it waits on this one)
+        _kv_set("board_retry_at", now_utc())
     for kind, toks in rules.get("ats_boards", {}).items():
         if isinstance(toks, list):
             for t in toks:
                 conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, t.lower(), "seed", now_utc()))
     conn.commit()
-    limit = int(os.environ.get("BOARDS_PER_RUN", "2500" if SCAN_MODE != "light" else "800"))
-    total = conn.execute("SELECT COUNT(*) FROM ats_boards WHERE failures < 3").fetchone()[0]
+    limit = int(os.environ.get("BOARDS_PER_RUN", "6000" if SCAN_MODE != "light" else "2500"))
+    heavy = tuple(xs.ENTERPRISE_KINDS) if xs else ()
+    skip = "kind NOT IN (%s)" % ",".join("?" * len(heavy)) if heavy else "1=1"
+    total = conn.execute(f"SELECT COUNT(*) FROM ats_boards WHERE failures < 3 AND {skip}", heavy).fetchone()[0]
     # 60% of each scan: boards that already produced India/remote roles (seeded, discovered, or a dataset board that hit);
     # 40%: the big imported directories, so they're all tried without starving the proven boards
     proven = [(r["kind"], r["token"]) for r in conn.execute(
-        "SELECT kind, token FROM ats_boards WHERE failures < 3 AND source != 'dataset' ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
-        (int(limit * 0.6),))]
+        f"SELECT kind, token FROM ats_boards WHERE failures < 3 AND source != 'dataset' AND {skip} ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
+        (*heavy, int(limit * 0.6)))]
     boards = proven + [(r["kind"], r["token"]) for r in conn.execute(
-        "SELECT kind, token FROM ats_boards WHERE failures < 3 AND source = 'dataset' ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
-        (limit - len(proven),))]
+        f"SELECT kind, token FROM ats_boards WHERE failures < 3 AND source = 'dataset' AND {skip} ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
+        (*heavy, limit - len(proven)))]
     stamp = now_utc()
     conn.executemany("UPDATE ats_boards SET last_polled=? WHERE kind=? AND token=?", [(stamp, k, t) for k, t in boards])
     conn.commit()
     conn.close()
     print(f"[ats-boards] polling {len(boards)} of {total} company boards (rotation)...")
-    with ThreadPoolExecutor(20) as ex:
+    with ThreadPoolExecutor(32) as ex:
         results = list(ex.map(lambda b: _fetch_board(b, rules), boards))
+    _flush_board_results()
     out = [j for r in results for j in r]
     hits = [b for b, r in zip(boards, results) if r]
     if hits:                                             # a directory board that has matching roles joins the proven set
@@ -3200,6 +3337,70 @@ def collect_ats_boards(rules: dict) -> list[dict]:
         conn.commit()
         conn.close()
     print(f"  → {len(out)} candidate roles (India/remote-eligible, title-filtered)")
+    return out
+
+
+def collect_enterprise_ats(rules: dict) -> list[dict]:
+    """Big-company job systems that need several searches per company: Oracle Cloud HCM (JPMorgan, Oracle ...),
+    Eightfold (Microsoft, Qualcomm, PayPal ...), Phenom (PwC ...), SAP SuccessFactors (Deloitte, HCLTech ...)."""
+    if not xs:
+        return []
+    conn = get_db()
+    for kind in xs.ENTERPRISE_KINDS:                     # verified seeds always in the rotation
+        for t in xs.SEEDS.get(kind, []):
+            conn.execute("INSERT OR IGNORE INTO ats_boards (kind, token, source, added_at) VALUES (?,?,?,?)", (kind, t, "seed", now_utc()))
+    lim = int(os.environ.get("ENTERPRISE_PER_RUN", "40" if SCAN_MODE == "light" else "150"))
+    q = ",".join("?" * len(xs.ENTERPRISE_KINDS))
+    boards = [(r["kind"], r["token"]) for r in conn.execute(
+        f"SELECT kind, token FROM ats_boards WHERE failures < 3 AND kind IN ({q}) AND source != 'dataset' "
+        f"ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (*xs.ENTERPRISE_KINDS, lim // 2))]
+    boards += [(r["kind"], r["token"]) for r in conn.execute(
+        f"SELECT kind, token FROM ats_boards WHERE failures < 3 AND kind IN ({q}) AND source = 'dataset' "
+        f"ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (*xs.ENTERPRISE_KINDS, lim - len(boards)))]
+    conn.executemany("UPDATE ats_boards SET last_polled=? WHERE kind=? AND token=?", [(now_utc(), k, t) for k, t in boards])
+    conn.commit()
+    conn.close()
+    print(f"[enterprise-ats] polling {len(boards)} Oracle / Eightfold / Phenom / SuccessFactors sites ...")
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda b: _fetch_board(b, rules), boards))
+    _flush_board_results()
+    hits = [b for b, r in zip(boards, results) if r]
+    if hits:
+        conn = get_db()
+        conn.executemany("UPDATE ats_boards SET source='dataset-hit' WHERE kind=? AND token=? AND source='dataset'", hits)
+        conn.commit()
+        conn.close()
+    out = [j for r in results for j in r]
+    print(f"  → {len(out)} candidate roles")
+    return out
+
+
+def collect_multi_company(rules: dict) -> list[dict]:
+    """Searches that span many companies at once and link to each company's own posting: Remote Rocketship's
+    India pages, Google Careers, and (full scans) VC-portfolio boards on Getro + Workable's job search.
+    Every company link seen also adds that company's board to the rotation."""
+    if not xs:
+        return []
+    tasks = [("remoterocketship", s) for s in xs.RR_SLUGS] + [("google", q) for q in xs.SEEDS.get("google", [])]
+    if SCAN_MODE == "full":
+        tasks += [("getro", t) for t in xs.SEEDS.get("getro", [])] + [("workable_search", q) for q in xs.SEEDS.get("workable_search", [])]
+    src = {"remoterocketship": "remoterocketship", "google": "bigco:google", "getro": "getro", "workable_search": "ats:workable"}
+
+    def run(t):
+        try:
+            return t, xs.FETCHERS[t[0]](t[1])
+        except Exception as exc:
+            print(f"  [{t[0]} ✗] {t[1]}: {exc}")
+            return t, []
+    out, seen_urls = [], []
+    with ThreadPoolExecutor(6) as ex:
+        for (kind, tok), rows in ex.map(run, tasks):
+            seen_urls += [r.get("url", "") for r in rows]
+            if kind in ("remoterocketship", "getro"):     # their dates are when *they* saw the job: use the company's own
+                rows = [dict(r, posted_date="") for r in rows]
+            out += _xs_jobs(kind, tok, rows, rules, source=src[kind])
+    added = _harvest_tokens(seen_urls)
+    print(f"[multi-company] {len(tasks)} searches → {len(out)} candidate roles · {added} new company boards found")
     return out
 
 
@@ -3249,6 +3450,11 @@ def _fetch_workday(board: tuple[str, str, str], rules: dict) -> list[dict]:
     out: dict[str, dict] = {}
     deadline = time.time() + 75                                   # never let one slow / rate-limited tenant stall the scan
     throttled = 0
+    pre = http_post(f"https://{host}/wday/cxs/{tenant}/{site}/jobs",       # one cheap call: any opening in India at all?
+                    {"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": "India"}, timeout=20, extra_headers=_WD_HEADERS)
+    if isinstance(pre, dict) and pre.get("jobPostings") == [] and not re.search(r"remote", site, re.I):
+        _wd_failed(board, False)
+        return []
     for q in _WD_QUERIES:
         for offset in (0, 20):
             if time.time() > deadline or throttled >= 2:
@@ -3277,11 +3483,23 @@ def _fetch_workday(board: tuple[str, str, str], rules: dict) -> list[dict]:
     return list(out.values())
 
 
+_WD_RESULTS: list[tuple[tuple[str, str, str], bool]] = []
+
+
 def _wd_failed(board: tuple[str, str, str], failed: bool) -> None:
+    with _BOARD_RESULTS_LOCK:                                    # written in one go after polling (see _flush_board_results)
+        _WD_RESULTS.append((board, failed))
+
+
+def _flush_wd_results() -> None:
+    with _BOARD_RESULTS_LOCK:
+        rows, _WD_RESULTS[:] = list(_WD_RESULTS), []
+    if not rows:
+        return
     conn = get_db()
     try:
-        conn.execute("UPDATE workday_boards SET failures=? WHERE host=? AND tenant=? AND site=?",
-                     ((conn.execute("SELECT failures FROM workday_boards WHERE host=? AND tenant=? AND site=?", board).fetchone() or [0])[0] + 1 if failed else 0, *board))
+        conn.executemany("UPDATE workday_boards SET failures=failures+1 WHERE host=? AND tenant=? AND site=?", [b for b, f in rows if f])
+        conn.executemany("UPDATE workday_boards SET failures=0 WHERE host=? AND tenant=? AND site=?", [b for b, f in rows if not f])
         conn.commit()
     finally:
         conn.close()
@@ -3293,16 +3511,22 @@ def collect_workday(rules: dict) -> list[dict]:
         conn.execute("INSERT OR IGNORE INTO workday_boards (host, tenant, site, source) VALUES (?,?,?,?)",
                      (b["host"], b["tenant"], b["site"], "seed"))
     conn.commit()
-    lim = int(os.environ.get("WORKDAY_PER_RUN", "120" if SCAN_MODE == "light" else "400"))
+    lim = int(os.environ.get("WORKDAY_PER_RUN", "400" if SCAN_MODE == "light" else "1500"))
+    # half proven (seeded / harvested / India-named sites), half the big imported list — each least-recently-polled first
     boards = [(r["host"], r["tenant"], r["site"]) for r in conn.execute(
-        "SELECT host, tenant, site FROM workday_boards WHERE failures < 4 ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (lim,))]
+        "SELECT host, tenant, site FROM workday_boards WHERE failures < 4 AND IFNULL(source,'') != 'dataset' "
+        "ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (lim // 2,))]
+    boards += [(r["host"], r["tenant"], r["site"]) for r in conn.execute(
+        "SELECT host, tenant, site FROM workday_boards WHERE failures < 4 AND IFNULL(source,'') = 'dataset' "
+        "ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (lim - len(boards),))]
     stamp = now_utc()
     conn.executemany("UPDATE workday_boards SET last_polled=? WHERE host=? AND tenant=? AND site=?", [(stamp, *b) for b in boards])
     conn.commit()
     conn.close()
     print(f"[workday] polling {len(boards)} Workday career sites ...")
-    with ThreadPoolExecutor(5) as ex:
+    with ThreadPoolExecutor(10) as ex:
         results = list(ex.map(lambda b: _fetch_workday(b, rules), boards))
+    _flush_wd_results()
     out = [j for r in results for j in r]
     print(f"  → {len(out)} candidate roles")
     return out
@@ -3406,8 +3630,8 @@ def zoho_jobs(token: str) -> list[dict] | None:
                 if str(j.get("Remote_Job", "")).lower() == "true":
                     loc = (loc + " / Remote").strip(" /")
                 try:
-                    date = datetime.strptime(j.get("Date_Opened", ""), "%m/%d/%Y").strftime("%Y-%m-%d")
-                except ValueError:
+                    date = datetime.strptime(j.get("Date_Opened") or "", "%m/%d/%Y").strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
                     date = ""
                 out.append({"title": j.get("Posting_Title") or j.get("Job_Opening_Name", ""), "url": j.get("$url", ""),
                             "location": loc, "jd": _html_to_text(j.get("Job_Description") or ""),
@@ -4519,6 +4743,12 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.execute("DELETE FROM rejected_urls WHERE reason LIKE 'board-only%' OR (url LIKE '%linkedin.com/jobs%' AND reason LIKE 'opening date%')")
         conn.commit()
         _kv_set("li_resolve_retry", "v1")
+    if _kv_get("token_pack") != _TOKEN_PACK_VERSION and _TOKEN_PACK.exists():   # ~98k public company boards (data/)
+        try:
+            import_token_pack(conn)
+            _kv_set("token_pack", _TOKEN_PACK_VERSION)
+        except Exception as exc:
+            print(f"  [token-pack ✗] {exc}")
     cur = conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (now_utc(),))
     run_id = cur.lastrowid
     conn.commit()
@@ -4535,6 +4765,8 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             collect_huntyourtribe, collect_urbanodx, collect_jsguru,
             collect_remoteok, collect_remotive, collect_himalayas, collect_jobicy, collect_weworkremotely,
             collect_linkedin_jobs,       # LinkedIn search → the company's own careers page (light: last 24 h only)
+            collect_enterprise_ats,      # Oracle HCM / Eightfold / Phenom / SuccessFactors (big companies)
+            collect_multi_company,       # Remote Rocketship India, Google Careers (+ Getro VC boards, Workable search on full scans)
         ]
         if SCAN_MODE == "full":
             collectors += [
