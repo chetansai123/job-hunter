@@ -4500,6 +4500,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
         conn.execute("DELETE FROM rejected_urls")
         conn.commit()
         _kv_set("rules_version", "2026-11-25-py-java")
+    if _kv_get("li_resolve_retry") != "v1":                 # new LinkedIn → career-page resolver: retry the 'no company link' rejects
+        conn.execute("DELETE FROM rejected_urls WHERE reason LIKE 'board-only%' OR (url LIKE '%linkedin.com/jobs%' AND reason LIKE 'opening date%')")
+        conn.commit()
+        _kv_set("li_resolve_retry", "v1")
     cur = conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (now_utc(),))
     run_id = cur.lastrowid
     conn.commit()
