@@ -3175,8 +3175,14 @@ def collect_ats_boards(rules: dict) -> list[dict]:
     conn.commit()
     limit = int(os.environ.get("BOARDS_PER_RUN", "2500" if SCAN_MODE != "light" else "800"))
     total = conn.execute("SELECT COUNT(*) FROM ats_boards WHERE failures < 3").fetchone()[0]
-    boards = [(r["kind"], r["token"]) for r in conn.execute(
-        "SELECT kind, token FROM ats_boards WHERE failures < 3 ORDER BY IFNULL(last_polled,'') ASC LIMIT ?", (limit,))]
+    # 60% of each scan: boards that already produced India/remote roles (seeded, discovered, or a dataset board that hit);
+    # 40%: the big imported directories, so they're all tried without starving the proven boards
+    proven = [(r["kind"], r["token"]) for r in conn.execute(
+        "SELECT kind, token FROM ats_boards WHERE failures < 3 AND source != 'dataset' ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
+        (int(limit * 0.6),))]
+    boards = proven + [(r["kind"], r["token"]) for r in conn.execute(
+        "SELECT kind, token FROM ats_boards WHERE failures < 3 AND source = 'dataset' ORDER BY IFNULL(last_polled,'') ASC LIMIT ?",
+        (limit - len(proven),))]
     stamp = now_utc()
     conn.executemany("UPDATE ats_boards SET last_polled=? WHERE kind=? AND token=?", [(stamp, k, t) for k, t in boards])
     conn.commit()
@@ -3185,6 +3191,12 @@ def collect_ats_boards(rules: dict) -> list[dict]:
     with ThreadPoolExecutor(20) as ex:
         results = list(ex.map(lambda b: _fetch_board(b, rules), boards))
     out = [j for r in results for j in r]
+    hits = [b for b, r in zip(boards, results) if r]
+    if hits:                                             # a directory board that has matching roles joins the proven set
+        conn = get_db()
+        conn.executemany("UPDATE ats_boards SET source='dataset-hit' WHERE kind=? AND token=? AND source='dataset'", hits)
+        conn.commit()
+        conn.close()
     print(f"  → {len(out)} candidate roles (India/remote-eligible, title-filtered)")
     return out
 
