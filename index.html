@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Job Hunter 🎯</title>
+<style>
+:root{--bg:#07090f;--card:#0f1520;--card2:#111827;--border:#1e2d42;--text:#e2eaf5;
+      --muted:#7a8fa8;--accent:#3b82f6;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;
+      --purple:#a78bfa;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+     background:var(--bg);color:var(--text);min-height:100vh;}
+.wrap{max-width:1380px;margin:0 auto;padding:24px 18px 80px;}
+header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;
+       gap:14px;margin-bottom:16px;}
+h1{font-size:22px;letter-spacing:-.03em;}
+.sub{color:var(--muted);font-size:12px;margin-top:3px;}
+/* tabs */
+.tabs{display:flex;border-bottom:2px solid var(--border);margin-bottom:18px;gap:0;}
+.tab{padding:9px 20px;font-size:13px;font-weight:600;cursor:pointer;background:0;
+     border:0;color:var(--muted);border-bottom:3px solid transparent;margin-bottom:-2px;transition:.15s;}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+/* stats */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
+.stat .num{font-size:22px;font-weight:700;}
+.stat .lbl{font-size:11px;color:var(--muted);margin-top:2px;}
+/* controls */
+.controls{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:14px;align-items:center;}
+input,select,textarea{background:var(--card);color:var(--text);border:1px solid var(--border);
+                      border-radius:7px;padding:8px 11px;font-size:13px;outline:none;}
+input[type=text]{flex:1;min-width:200px;}
+select:focus,input:focus{border-color:var(--accent);}
+button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:8px 13px;
+       font-size:13px;font-weight:600;cursor:pointer;transition:.15s;}
+button:hover{opacity:.85;}
+button.sec{background:var(--card2);color:var(--text);border:1px solid var(--border);}
+button.ok{background:#15803d;} button.warn{background:#92400e;} button.bad{background:#991b1b;}
+button.purple{background:#6d28d9;}
+/* grid & job card */
+.grid{display:grid;gap:11px;}
+.job{background:var(--card);border:1px solid var(--border);border-radius:11px;
+     padding:15px 17px;display:grid;gap:9px;transition:.15s;}
+.job:hover{border-color:#2d4a6e;}
+.jt{display:flex;flex-wrap:wrap;justify-content:space-between;gap:9px;align-items:flex-start;}
+.job-title{font-size:16px;font-weight:700;line-height:1.3;}
+.company{color:var(--accent);font-weight:600;font-size:13px;margin-top:2px;}
+.founder-row{font-size:12px;color:#93c5fd;margin-top:3px;display:flex;flex-wrap:wrap;gap:6px;}
+.badges{display:flex;flex-wrap:wrap;gap:5px;align-items:center;}
+.badge{font-size:11px;padding:2px 8px;border-radius:999px;background:#1a2740;
+       color:var(--muted);border:1px solid var(--border);}
+.badge.score{color:#86efac;border-color:#166534;background:#052e16;}
+.badge.sn{color:#93c5fd;border-color:#1d4ed8;background:#0c1f4a;}
+.badge.sa{color:#86efac;border-color:#15803d;background:#052e16;}
+.badge.ss{color:#fcd34d;border-color:#92400e;background:#2d1a04;}
+.badge.sr{color:#fca5a5;border-color:#991b1b;background:#2d0808;}
+.meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:12px;}
+.reason{font-size:13px;line-height:1.5;color:#c8d8ea;}
+.actions{display:flex;flex-wrap:wrap;gap:7px;align-items:center;}
+a.apply-btn{background:var(--accent);color:#fff;text-decoration:none;padding:7px 13px;
+            border-radius:7px;font-size:13px;font-weight:600;}
+a.apply-btn:hover{opacity:.85;}
+/* post card */
+.post{background:var(--card2);border:1px solid var(--border);border-radius:11px;
+      padding:14px 17px;display:grid;gap:7px;transition:.15s;}
+.post:hover{border-color:#2d4a6e;}
+.post-src{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--amber);font-weight:700;}
+.post-name{font-size:15px;font-weight:700;}
+.post-role{font-size:11px;color:var(--muted);}
+.post-skills{font-size:11px;color:#86efac;}
+.post-body{font-size:12px;line-height:1.6;color:#a8bdd4;
+           max-height:160px;overflow:hidden;white-space:pre-wrap;position:relative;}
+.post-body.exp{max-height:none;}
+.pactions{display:flex;gap:7px;flex-wrap:wrap;align-items:center;}
+a.view-btn{background:var(--card);color:var(--text);text-decoration:none;padding:6px 11px;
+           border-radius:7px;font-size:12px;font-weight:600;border:1px solid var(--border);}
+/* scan box */
+.scan-box{background:var(--card);border:1px solid var(--border);border-radius:11px;
+          padding:14px;margin-bottom:16px;display:none;}
+.scan-box.open{display:block;}
+.scan-box textarea{width:100%;min-height:68px;margin:9px 0;resize:vertical;}
+/* header btns */
+.hbtns{display:flex;gap:7px;flex-wrap:wrap;}
+#scanAllBtn{background:#6d28d9;}
+/* loader */
+.loader{text-align:center;padding:40px;color:var(--muted);font-size:14px;}
+/* source tag colours */
+.src-remoteok{background:#0d2a1f;color:#34d399;border-color:#065f46;}
+.src-remotive{background:#0d1f2a;color:#60a5fa;border-color:#1d4ed8;}
+.src-arbeitnow{background:#1f1420;color:#c084fc;border-color:#7e22ce;}
+.src-himalayas{background:#201a08;color:#fbbf24;border-color:#92400e;}
+.src-jobicy{background:#08141f;color:#38bdf8;border-color:#075985;}
+.src-wwr{background:#0f1f10;color:#4ade80;border-color:#166534;}
+.src-muse{background:#1f0d13;color:#f9a8d4;border-color:#9d174d;}
+.src-firecrawl{background:#0d1520;color:#a5b4fc;border-color:#4338ca;}
+.src-career{background:#111820;color:#94a3b8;border-color:#334155;}
+.src-ats{background:#0b1f1a;color:#5eead4;border-color:#0f766e;}
+.contacts{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:5px;}
+.contacts .clabel{font-size:11px;color:var(--muted);}
+a.chip{font-size:11px;padding:2px 8px;border-radius:999px;text-decoration:none;
+       background:#10203a;color:#93c5fd;border:1px solid #1d4ed8;}
+a.chip.search{background:#161b26;color:#94a3b8;border-color:#334155;}
+.notes{font-size:11px;color:var(--muted);word-break:break-all;}
+.badge.direct{color:#86efac;border-color:#15803d;background:#052e16;}
+.badge.board{color:#fcd34d;border-color:#92400e;background:#2d1a04;}
+.badge.lock{color:#fca5a5;border-color:#991b1b;background:#2d0808;}
+a.apply-btn.board{background:#92400e;}
+#scanBanner{display:none;background:#1e1b4b;border:1px solid #4338ca;color:#c7d2fe;border-radius:9px;
+            padding:9px 13px;font-size:13px;margin-bottom:12px;}
+/* cold reach-out composer (Gmail-style) */
+#cmp{position:fixed;inset:0;background:rgba(3,6,12,.62);z-index:9000;display:none;align-items:center;justify-content:center;padding:18px;}
+#cmp.open{display:flex;}
+.cmp-win{background:#fff;color:#202124;width:min(860px,100%);max-height:96vh;border-radius:12px;display:flex;flex-direction:column;overflow-y:auto;
+         box-shadow:0 12px 48px rgba(0,0,0,.55);font-family:"Google Sans",Roboto,-apple-system,Arial,sans-serif;}
+.cmp-head{background:#f2f6fc;padding:11px 16px;display:flex;justify-content:space-between;align-items:center;font-size:14px;font-weight:600;}
+.cmp-head button{background:0;color:#444;font-size:18px;padding:0 6px;}
+.cmp-ctx{background:#f8fafd;border-bottom:1px solid #e3e8ef;padding:10px 16px;display:grid;gap:8px;
+         grid-template-columns:1fr 1fr;}
+.cmp-ctx label{font-size:11px;color:#5f6368;display:grid;gap:3px;}
+.cmp-ctx input,.cmp-ctx select{background:#fff;color:#202124;border:1px solid #dadce0;border-radius:6px;padding:7px 9px;font-size:13px;}
+.cmp-ctx .full{grid-column:1/-1;}
+.cmp-ctx .gen{grid-column:1/-1;display:flex;gap:10px;align-items:center;}
+.cmp-ctx .gen button{background:#0b57d0;border-radius:18px;padding:8px 18px;white-space:nowrap;flex:none;}
+.cmp-ctx .gen{flex-wrap:wrap;}
+.cmp-ctx .gen button:disabled{opacity:.55;cursor:wait;}
+.cmp-row{display:flex;align-items:center;border-bottom:1px solid #f1f3f4;padding:0 16px;min-height:38px;font-size:14px;}
+.cmp-row span.k{color:#5f6368;width:62px;flex:none;font-size:13px;}
+.cmp-row input{flex:1;border:0;background:transparent;color:#202124;padding:9px 0;font-size:14px;outline:none;min-width:0;}
+.cmp-row .v{color:#202124;font-size:14px;}
+#cmpBody{flex:1 0 auto;min-height:220px;overflow:auto;padding:14px 16px;font-size:14px;line-height:1.55;outline:none;color:#202124;}
+#cmpBody p{margin:0 0 11px;} #cmpBody ul{margin:0 0 11px 22px;} #cmpBody a{color:#0b57d0;}
+.cmp-att{padding:0 16px 8px;display:flex;gap:8px;align-items:center;font-size:13px;}
+.cmp-att label{background:#f1f3f4;border-radius:6px;padding:5px 10px;display:flex;gap:6px;align-items:center;cursor:pointer;}
+.cmp-flags{margin:0 16px 8px;background:#fef7e0;border:1px solid #f9e3a0;color:#5c4400;border-radius:8px;padding:8px 11px;font-size:12px;display:none;}
+.cmp-flags.show{display:block;} .cmp-flags ul{margin:4px 0 0 18px;} .cmp-flags a{color:#5c4400;}
+.cmp-warn{margin:0 16px 8px;background:#fce8e6;color:#a50e0e;border-radius:8px;padding:7px 11px;font-size:12px;display:none;}
+.cmp-warn.show{display:block;}
+.cmp-foot{padding:10px 16px 14px;display:flex;gap:9px;align-items:center;flex-wrap:wrap;border-top:1px solid #f1f3f4;}
+.cmp-foot .send{background:#0b57d0;border-radius:18px;padding:9px 22px;}
+.cmp-foot .lite{background:#fff;color:#0b57d0;border:1px solid #dadce0;border-radius:18px;}
+.cmp-foot button:disabled{opacity:.5;cursor:not-allowed;}
+#cmpStatus{font-size:12px;color:#5f6368;flex:1;min-width:160px;}
+.cmp-note{padding:8px 16px;background:#e8f0fe;color:#174ea6;font-size:12px;display:none;} .cmp-note.show{display:block;}
+.cmp-note a{color:#174ea6;font-weight:600;cursor:pointer;}
+button.chip-btn{font-size:11px;padding:2px 9px;border-radius:999px;background:#2a1a4a;color:#d8b4fe;border:1px solid #6d28d9;font-weight:600;}
+.recs:empty{display:none;} .recs{display:grid;gap:5px;margin-top:4px;padding:8px 10px;background:#0b1220;border:1px solid var(--border);border-radius:8px;}
+.rec-row{font-size:12px;display:flex;flex-wrap:wrap;gap:7px;align-items:center;color:#a8bdd4;}
+.rec-row a b{color:#93c5fd;}
+.cmp-ctx .gen select{padding:7px 8px;}
+.cmp-cloud{display:none;padding:10px 16px;background:#f8fafd;border-bottom:1px solid #e3e8ef;font-size:12px;color:#3c4043;gap:7px;}
+.cmp-cloud.show{display:grid;} .cmp-cloud input{background:#fff;color:#202124;border:1px solid #dadce0;border-radius:6px;padding:7px 9px;font-size:13px;}
+.cmp-cloud button{background:#0b57d0;border-radius:18px;justify-self:start;}
+.cmp-cloud label{display:grid;gap:3px;font-size:11px;color:#5f6368;} .cmp-cloud code{background:#e8eaed;padding:1px 5px;border-radius:4px;}
+@media (max-width:640px){ .cmp-ctx{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div>
+    <h1>🎯 Job Hunter</h1>
+    <div class="sub" id="lastScan">GitHub scans in the cloud: light every 4 h, full twice a day · only direct company links or apply-by-email are shown</div>
+  </div>
+  <div class="hbtns">
+    <button class="sec" onclick="toggleScan()">+ Manual Scan</button>
+    <button id="scanAllBtn" onclick="triggerAutoScan()">🔍 Scan Now</button>
+    <button class="sec" onclick="syncCloud()" id="syncBtn">☁️ Sync Cloud</button>
+    <button class="sec" onclick="refresh()">↻ Refresh</button>
+  </div>
+</header>
+
+<div id="scanBanner"></div>
+<div id="scanBox" class="scan-box">
+  <strong>Scan specific career pages / job URLs (via firecrawl-local)</strong>
+  <textarea id="customUrls" placeholder="One URL per line. Leave empty → full auto-scan of all sources."></textarea>
+  <div style="display:flex;gap:9px;align-items:center;">
+    <button onclick="triggerScan()">Start Scan</button>
+    <span id="scanStatus" style="font-size:12px;color:var(--muted);"></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" id="tabJobs" onclick="switchTab('jobs')">💼 Jobs</button>
+  <button class="tab" id="tabPosts" onclick="switchTab('posts')">📢 Posts (Founders & Recruiters)</button>
+  <button class="tab" id="tabStartups" onclick="switchTab('startups')">💰 Funded startups</button>
+</div>
+
+<!-- ─── JOBS PANEL ────────────────────────────────────────────── -->
+<div id="panelJobs">
+  <div class="stats" id="jobStats"></div>
+  <div class="controls">
+    <input type="text" id="q" placeholder="Search role, company, stack, location…" oninput="renderJobs()"/>
+    <select id="stFilter" onchange="renderJobs()">
+      <option value="all">All Statuses</option>
+      <option value="new" selected>New</option>
+      <option value="saved">Saved</option>
+      <option value="applied">Applied</option>
+      <option value="rejected">Rejected</option>
+      <option value="deleted">Deleted</option>
+    </select>
+    <select id="catFilter" onchange="renderJobs()">
+      <option value="all">All Roles</option>
+      <option value="Full Stack">Full Stack</option>
+      <option value="Backend">Backend</option>
+      <option value="Frontend">Frontend</option>
+    </select>
+    <select id="srcFilter" onchange="renderJobs()">
+      <option value="all">All Sources</option>
+      <option value="remoteok">RemoteOK</option>
+      <option value="remotive">Remotive</option>
+      <option value="arbeitnow">Arbeitnow</option>
+      <option value="himalayas">Himalayas</option>
+      <option value="jobicy">Jobicy</option>
+      <option value="workingnomads">WorkingNomads</option>
+      <option value="weworkremotely">WeWorkRemotely</option>
+      <option value="huntyourtribe">HuntYourTribe</option>
+      <option value="urbanodx">RoleFinder (UrbanoDX)</option>
+      <option value="jsgurujobs">JSGuruJobs</option>
+      <option value="matcha">Matcha</option>
+      <option value="ats">ATS boards (Greenhouse/Lever/Ashby)</option>
+      <option value="firecrawl">Firecrawl</option>
+      <option value="career">Career Pages</option>
+      <option value="manual">Manual Scan</option>
+    </select>
+    <select id="linkFilter" onchange="renderJobs()">
+      <option value="all">All Links</option>
+      <option value="direct">Direct company links</option>
+      <option value="email">Apply by email</option>
+    </select>
+    <select id="scoreFilter" onchange="renderJobs()">
+      <option value="0">Any Score</option>
+      <option value="7">Score ≥ 7</option>
+      <option value="8">Score ≥ 8</option>
+    </select>
+  </div>
+  <div class="grid" id="jobs"><div class="loader">Loading jobs…</div></div>
+</div>
+
+<!-- ─── POSTS PANEL ───────────────────────────────────────────── -->
+<div id="panelPosts" style="display:none">
+  <div class="stats" id="postStats"></div>
+  <div class="controls">
+    <input type="text" id="pq" placeholder="Search poster, skill, keyword…" oninput="renderPosts()"/>
+    <select id="pSrcFilter" onchange="renderPosts()">
+      <option value="all">All Sources</option>
+      <option value="HN">HN Who's Hiring</option>
+      <option value="Reddit">Reddit</option>
+      <option value="LinkedIn">LinkedIn</option>
+      <option value="X/">X/Twitter</option>
+    </select>
+    <select id="pStFilter" onchange="renderPosts()">
+      <option value="all">All Statuses</option>
+      <option value="new" selected>New</option>
+      <option value="saved">Saved</option>
+      <option value="contacted">Contacted</option>
+    </select>
+  </div>
+  <div class="grid" id="posts"><div class="loader">Loading posts…</div></div>
+</div>
+
+<!-- ─── FUNDED STARTUPS PANEL ─────────────────────────────────── -->
+<div id="panelStartups" style="display:none">
+  <div class="stats" id="stStats"></div>
+  <div class="controls">
+    <input type="text" id="sq" placeholder="Search startup, sector, investor, city…" oninput="renderStartups()"/>
+    <select id="sTech" onchange="renderStartups()">
+      <option value="tech" selected>Tech startups</option>
+      <option value="tiny">👥 Tiny: under 30 people</option>
+      <option value="small">👥 Small: 50 people or fewer</option>
+      <option value="all">All sectors</option>
+    </select>
+    <select id="sHiring" onchange="renderStartups()">
+      <option value="all">Any hiring signal</option>
+      <option value="dev">Open developer roles</option>
+      <option value="any">Roles or hiring posts</option>
+    </select>
+    <select id="sAge" onchange="renderStartups()">
+      <option value="99999" selected>All startups (worldwide)</option>
+      <option value="183">Funded in last 6 months</option>
+      <option value="90">Last 3 months</option>
+      <option value="30">Last 30 days</option>
+    </select>
+    <select id="sStFilter" onchange="renderStartups()">
+      <option value="all">All statuses</option>
+      <option value="new" selected>New</option>
+      <option value="saved">Saved</option>
+      <option value="contacted">Contacted</option>
+    </select>
+  </div>
+  <div class="grid" id="startups"><div class="loader">Loading funded startups…</div></div>
+</div>
+</div>
+
+<!-- ─── COLD REACH-OUT COMPOSER ──────────────────────────────── -->
+<div id="cmp" onclick="if(event.target===this) closeCompose()">
+ <div class="cmp-win">
+  <div class="cmp-head"><span>✉ Cold reach-out</span><button onclick="closeCompose()" title="Close">✕</button></div>
+  <div class="cmp-note" id="cmpNote"></div>
+  <div class="cmp-cloud" id="cmpCloud">
+    <b>Cloud composer setup (once per browser)</b>
+    <span>1. On your Mac, run <code>./setup_cloud_composer.sh</code> once. It prints your compose key.</span>
+    <span>2. Create a GitHub token: <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com → fine-grained token</a>,
+      repository access: only <b id="cmpRepoName">job-hunter</b>; permissions: <b>Actions: Read and write</b>, <b>Contents: Read-only</b>.</span>
+    <label>GitHub token <input id="cmpGhTok" type="password" placeholder="github_pat_…" autocomplete="off"/></label>
+    <label>Compose key <input id="cmpKey" type="password" placeholder="printed by setup_cloud_composer.sh" autocomplete="off"/></label>
+    <span>Both stay in this browser only (localStorage). Generate and Send then run on GitHub Actions with your Claude plan and Gmail.</span>
+    <button onclick="saveCloudSetup()">Save</button>
+  </div>
+  <div class="cmp-ctx">
+    <label>Company<input id="cmpCompany"/></label>
+    <label>Role<input id="cmpRole"/></label>
+    <label class="full">Job link<input id="cmpLink" placeholder="https://…"/></label>
+    <label>Who you're writing to
+      <select id="cmpType">
+        <option value="founder">Founder / co-founder</option>
+        <option value="recruiter">Recruiter / HR</option>
+        <option value="referral">Employee (asking for a referral)</option>
+      </select></label>
+    <label>Their first name<input id="cmpName" placeholder="e.g. Priya"/></label>
+    <div class="gen"><button id="cmpGen" onclick="generateEmail()">✨ Generate</button>
+      <select id="cmpModel" title="Model that writes the email" onchange="localStorage.setItem('jh_cmp_model',this.value)">
+        <option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select>
+      <select id="cmpEffort" title="Effort level" onchange="localStorage.setItem('jh_cmp_effort',this.value)">
+        <option value="low">low effort</option><option value="medium">medium effort</option><option value="high">high effort</option>
+        <option value="xhigh">xhigh effort</option><option value="max">max effort</option></select>
+      <span id="cmpGenStatus" style="font-size:12px;color:#5f6368">Uses your ColdEmail rules; researches the company first (1–2 min).</span></div>
+  </div>
+  <div class="cmp-row"><span class="k">From</span><span class="v" id="cmpFrom">—</span></div>
+  <div class="cmp-row"><span class="k">To</span><input id="cmpTo" placeholder="name@company.com" oninput="checkRepeat()"/></div>
+  <div class="cmp-row"><span class="k">Subject</span><input id="cmpSubject"/></div>
+  <div class="cmp-warn" id="cmpWarn"></div>
+  <div id="cmpBody" contenteditable="true"></div>
+  <div class="cmp-flags" id="cmpFlags"></div>
+  <div class="cmp-att"><label><input type="checkbox" id="cmpAttach" checked/> 📎 <span id="cmpResume">resume</span></label></div>
+  <div class="cmp-foot">
+    <button class="send" id="cmpSend" onclick="sendEmail('send')">Send</button>
+    <button class="lite" id="cmpDraft" onclick="sendEmail('draft')" title="Puts it in your Gmail Drafts; you press Send in Gmail">Save as Gmail draft</button>
+    <button class="lite" onclick="openInGmail()" title="Opens Gmail's own compose window (plain text, no attachment)">Open in Gmail ↗</button>
+    <button class="lite" onclick="copyEmail()">Copy</button>
+    <span id="cmpStatus"></span>
+  </div>
+ </div>
+</div>
+
+<style>#scanAllBtn,#syncBtn,button[onclick="toggleScan()"]{display:none!important}
+#jhLock{position:fixed;inset:0;background:#0b0f19;z-index:99999;display:flex;align-items:center;justify-content:center;font-family:system-ui}
+#jhLock form{background:#111827;border:1px solid #374151;border-radius:14px;padding:28px;width:min(360px,90vw);text-align:center;color:#e5e7eb}
+#jhLock input{width:100%;padding:11px;margin:14px 0 8px;border-radius:8px;border:1px solid #4b5563;background:#0b0f19;color:#fff;box-sizing:border-box}
+#jhLock button{width:100%;padding:11px;border:0;border-radius:8px;background:#6d28d9;color:#fff;font-weight:600;cursor:pointer}
+#jhLock .err{color:#f87171;font-size:13px;min-height:18px}</style>
+<button>Unlock</button></form></div>
+<script>
+(function(){
+  const LS=localStorage, origFetch=window.fetch.bind(window); let DATA=null;
+  const ready=origFetch('data.json?'+Date.now()).then(r=>r.json()).then(d=>{DATA=d;});
+  const marks=()=>JSON.parse(LS.getItem('jh_marks')||'{}');
+  const json=o=>new Response(JSON.stringify(o),{headers:{'Content-Type':'application/json'}});
+  window.__jhNote=()=>DATA?('cloud data from '+new Date(DATA.meta.generated_at).toLocaleString()+' · refreshes about every 30 min'):'';
+  window.fetch=async function(url,opts){
+    const u=String(url);
+    if(!u.startsWith('/api/')) return origFetch(url,opts);
+    await ready; const m=marks();
+    if(u==='/api/jobs'){ const del=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+      return json(DATA.jobs.map(j=>({...j,status:del.has(j.direct_apply_url)?'deleted':(m['j'+j.job_hash]||'new')}))); }
+    if(u==='/api/posts') return json(DATA.posts.map(p=>({...p,status:m['p'+p.post_hash]||'new'})));
+    if(u==='/api/startups') return json((DATA.startups||[]).map(s=>({...s,status:m['s'+s.key]||'new'})));
+    if(u==='/api/meta') return json(DATA.meta.discovery||{});
+    if(u==='/api/status'){ const b=JSON.parse(opts.body);
+      if(b.type==='startup'){ m['s'+b.id]=b.status; LS.setItem('jh_marks',JSON.stringify(m)); return json({ok:true}); }
+      const row=(b.type==='post'?DATA.posts:DATA.jobs).find(r=>r.id===b.id);
+      if(row){ m[(b.type==='post'?'p'+row.post_hash:'j'+row.job_hash)]=b.status; LS.setItem('jh_marks',JSON.stringify(m));
+        if(b.type!=='post'){ const d=new Set(JSON.parse(LS.getItem('jh_deleted_urls')||'[]'));
+          if(b.status==='deleted') d.add(row.direct_apply_url); else d.delete(row.direct_apply_url);
+          LS.setItem('jh_deleted_urls',JSON.stringify([...d])); } } return json({ok:true}); }
+    if(u==='/api/stats') return json({total_jobs:DATA.jobs.length,last_scan:{finished_at:DATA.meta.generated_at},scan:{running:false}});
+    if(u==='/api/scan-status') return json({running:false,stage:''});
+    return json({ok:true,started:false});
+  };
+})();
+</script>
+<script>
+let allJobs=[], allPosts=[], allStartups=[], META={}, tab='jobs';
+
+const SRC_CLASS = {
+  remoteok:'src-remoteok', remotive:'src-remotive', arbeitnow:'src-arbeitnow',
+  himalayas:'src-himalayas', jobicy:'src-jobicy', weworkremotely:'src-wwr', ats:'src-ats',
+  themuse:'src-muse', firecrawl:'src-firecrawl',
+};
+
+function renderContacts(s){
+  let arr=[]; try{ arr=JSON.parse(s||'[]'); }catch(e){}
+  if(!arr.length) return '';
+  return `<div class="contacts"><span class="clabel">👥 Contacts:</span>`+arr.map(c=>{
+    const lbl = c.kind==='profile' ? `${esc(c.role)}: ${esc(c.name||'profile')}` : `${esc(c.role)} (search)`;
+    return `<a class="chip ${c.kind==='search'?'search':''}" href="${esc(c.url)}" target="_blank" rel="noopener" title="${esc(c.note)}">${lbl} ↗</a>`;
+  }).join('')+`</div>`;
+}
+
+function srcClass(src){
+  for(const [k,v] of Object.entries(SRC_CLASS)) if(src.includes(k)) return v;
+  if(src.includes('career')) return 'src-career';
+  return '';
+}
+
+function switchTab(t){
+  tab=t;
+  try{ localStorage.setItem('jh_tab',t); if(location.hash!=='#'+t) history.replaceState(null,'','#'+t); }catch(e){}
+  ['jobs','posts','startups'].forEach(x=>{
+    document.getElementById('panel'+x[0].toUpperCase()+x.slice(1)).style.display = x===t?'':'none';
+    document.getElementById('tab'+x[0].toUpperCase()+x.slice(1)).className='tab'+(x===t?' active':'');
+  });
+}
+
+function toggleScan(){ document.getElementById('scanBox').classList.toggle('open'); }
+
+async function syncCloud(){
+  const btn=document.getElementById('syncBtn');
+  btn.textContent='⏳ Syncing…'; btn.disabled=true;
+  try{
+    const r=await fetch('/api/sync',{method:'POST'});
+    const d=await r.json();
+    btn.textContent = d.ok ? ('✅ '+(d.output||'Synced')) : ('⚠️ '+(d.error||'Sync failed'));
+    setTimeout(()=>{ btn.textContent='☁️ Sync Cloud'; btn.disabled=false; },5000);
+  }catch(e){
+    btn.textContent='☁️ Sync Cloud'; btn.disabled=false;
+  }
+  await refresh();
+}
+
+async function loadStartups(){
+  try{ const r=await fetch('/api/startups'); allStartups=await r.json(); }catch(e){ allStartups=[]; }
+  renderStartups();
+}
+function daysSince(d){ return d ? Math.floor((Date.now()-new Date(d).getTime())/86400000) : 999; }
+function renderStartups(){
+  const q=(document.getElementById('sq').value||'').toLowerCase(), tech=document.getElementById('sTech').value,
+        hire=document.getElementById('sHiring').value, age=+document.getElementById('sAge').value, st=document.getElementById('sStFilter').value;
+  const f=allStartups.filter(s=>{
+    if(tech==='tech' && s.tech===false) return false;
+    if(tech==='tiny' && !s.tiny) return false;
+    if(tech==='small' && !s.small) return false;
+    if(daysSince(s.funded_on)>age) return false;
+    if(st!=='all' && (s.status||'new')!==st) return false;
+    const dev=(s.roles&&s.roles.dev||[]).length;
+    if(hire==='dev' && !dev) return false;
+    if(hire==='any' && !dev && !(s.roles&&s.roles.total) && !(s.hiring_posts||[]).length) return false;
+    if(q){ const hay=[s.name,s.sector,s.subsector,s.investors,s.lead,s.hq,s.description,(s.founders||[]).join(' ')].join(' ').toLowerCase(); if(!hay.includes(q)) return false; }
+    return true;
+  });
+  const withDev=allStartups.filter(s=>(s.roles&&s.roles.dev||[]).length).length;
+  document.getElementById('stStats').innerHTML=`
+    <div class="stat"><div class="num">${allStartups.length}</div><div class="lbl">Startups</div></div>
+    <div class="stat"><div class="num">${withDev}</div><div class="lbl">With open dev roles</div></div>
+    <div class="stat"><div class="num">${allStartups.filter(s=>(s.hiring_posts||[]).length).length}</div><div class="lbl">Posted hiring on LinkedIn</div></div>
+    <div class="stat"><div class="num">${f.length}</div><div class="lbl">Shown</div></div>`;
+  const el=document.getElementById('startups');
+  if(!f.length){ el.innerHTML='<div class="post"><div class="sub">No startups match — they are enriched a batch at a time, more appear after each full scan.</div></div>'; return; }
+  const link=(u,t)=>u?`<a class="view-btn" href="${esc(u)}" target="_blank" rel="noopener">${t} ↗</a>`:'';
+  const stPage=pageSlice('startups',f,[q,tech,hire,age,st].join('|'));
+  el.innerHTML=pagerHtml('startups',f.length,'renderStartups')+stPage.map(s=>{
+    const dev=(s.roles&&s.roles.dev)||[];
+    const founders=(s.founder_links||[]).map(x=> x.url ? `<a href="${esc(x.url)}" target="_blank">${esc(x.name)} (LinkedIn)</a>` : `${esc(x.name)} <a href="${esc(x.search)}" target="_blank" style="opacity:.7">(search)</a>`).join(' · ');
+    const team=(s.profiles||[]).filter(p=>p.role!=='Founder').slice(0,4).map(p=>`<a href="${esc(p.url)}" target="_blank">${esc(p.name||'profile')}</a>`).join(' · ');
+    const emails=(s.emails||[]).map(e=>`<a href="mailto:${esc(e.email)}">${esc(e.email)}</a> <span class="badge" style="font-size:10px">${esc(e.type)}</span>`).join(' ');
+    return `<div class="job">
+  <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+    <div><div class="post-name">${esc(s.name)}</div>
+      <div class="sub">${esc([s.sector,s.subsector,s.model].filter(Boolean).join(' · '))}${s.hq?' · 📍 '+esc(s.hq):''}${s.founded?' · since '+esc(s.founded):''}</div></div>
+    <div class="badges"><span class="badge score">⭐ ${s.score||0}/10</span>
+      ${s.funded_on?`<span class="badge direct">💰 ${esc(s.amount||'undisclosed')} ${esc(s.round||'')}</span><span class="badge">📅 ${esc(s.funded_on)}</span>`
+                   :`<span class="badge direct">${s.source==='yc'?'🟧 YC '+esc(s.round||''):esc(s.source||'startup')}</span>`}${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}${outreachBadge('startup',s.key)}</div>
+  </div>
+  ${s.description?`<div class="reason">${esc(s.description.slice(0,260))}</div>`:''}
+  <div class="meta">${s.investors?`<span>🏦 ${esc(s.investors)}</span>`:''}</div>
+  <div class="meta" style="flex-direction:column;align-items:flex-start;gap:4px">
+    ${founders?`<span>👤 Founders: ${founders}</span>`:''}
+    ${team?`<span>🧑‍💻 Team on their site: ${team}</span>`:''}
+    ${emails?`<span>✉ ${emails}</span>`:''}
+    <span>🔎 <a href="${esc(s.recruiter_search||'')}" target="_blank">Find their recruiter / HR on LinkedIn</a></span>
+  </div>
+  ${dev.length?`<div class="notes">🟢 Open developer roles (${dev.length}${s.roles.total?` of ${s.roles.total} open`:''}): ${dev.map(r=>`<a href="${esc(r.url)}" target="_blank">${esc(r.title)}</a>${r.location?' ('+esc(r.location)+')':''}${r.posted?' <span style="opacity:.7">· posted '+esc(r.posted)+'</span>':''}`).join(' · ')}</div>`
+             : (s.roles&&s.roles.total?`<div class="notes">${s.roles.total} open roles on their careers board (none match your stack yet)</div>`:'')}
+  ${(s.hiring_posts||[]).map(p=>`<div class="notes">📢 Hiring post ${esc(p.date||'')}: ${esc(p.text.slice(0,160))}… <a href="${esc(p.url)}" target="_blank">View ↗</a></div>`).join('')}
+  <div class="actions">
+    ${link(s.careers,'Careers page')}${link(s.website,'Website')}${link(s.linkedin,'LinkedIn')}${link(s.inc42,'Profile')}${link(s.article,'Funding news')}
+    ${reachBtn('startup',s.key)}
+    <button class="ok"   onclick="setStartupStatus('${esc(s.key)}','contacted')">✉ Contacted</button>
+    <button class="warn" onclick="setStartupStatus('${esc(s.key)}','saved')">★ Save</button>
+    <button class="bad"  onclick="setStartupStatus('${esc(s.key)}','rejected')">✗ Hide</button>
+  </div>
+</div>`;}).join('')+pagerHtml('startups',f.length,'renderStartups');
+}
+async function setStartupStatus(key,s){
+  await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:key,status:s,type:'startup'})});
+  await loadStartups();
+}
+
+async function loadMeta(){ try{ META=await (await fetch('/api/meta')).json(); }catch(e){ META={}; } }
+
+async function refresh(){
+  await loadMeta(); await loadOutreach();
+  await Promise.all([loadJobs(), loadPosts(), loadStartups()]);
+  document.getElementById('lastScan').textContent =
+    'Last refreshed: '+new Date().toLocaleTimeString()+' · '+(window.__jhNote ? window.__jhNote() : 'auto-syncs with the cloud every 10 min');
+}
+
+async function loadJobs(){
+  const r=await fetch('/api/jobs'); allJobs=await r.json();
+  renderJobStats(); renderJobs();
+}
+async function loadPosts(){
+  const r=await fetch('/api/posts'); allPosts=await r.json();
+  renderPostStats(); renderPosts();
+}
+
+function renderJobStats(){
+  const c={total:allJobs.length,new:0,saved:0,applied:0,rejected:0};
+  allJobs.forEach(j=>{ if(c[j.status]!==undefined) c[j.status]++; });
+  const nDirect=allJobs.filter(j=>j.link_type==='direct').length;
+  const nEmail=allJobs.filter(j=>j.link_type==='email').length;
+  document.getElementById('jobStats').innerHTML=`
+    <div class="stat"><div class="num">${nDirect}</div><div class="lbl">Direct links</div></div>
+    <div class="stat"><div class="num">${nEmail}</div><div class="lbl">Apply by email</div></div>
+    <div class="stat" title="Company job boards polled for new roles; grows every day through discovery"><div class="num">${META.boards||'–'}</div><div class="lbl">Companies tracked${META.new_7d?` (+${META.new_7d} this week)`:''}</div></div>
+    <div class="stat"><div class="num">${c.total}</div><div class="lbl">Total Jobs</div></div>
+    <div class="stat"><div class="num">${c.new}</div><div class="lbl">New</div></div>
+    <div class="stat"><div class="num">${c.saved}</div><div class="lbl">Saved</div></div>
+    <div class="stat"><div class="num">${c.applied}</div><div class="lbl">Applied</div></div>
+    <div class="stat"><div class="num">${c.rejected}</div><div class="lbl">Rejected</div></div>`;
+}
+function renderPostStats(){
+  const c={total:allPosts.length,new:0,saved:0,contacted:0};
+  allPosts.forEach(p=>{ if(c[p.status]!==undefined) c[p.status]++; });
+  document.getElementById('postStats').innerHTML=`
+    <div class="stat"><div class="num">${c.total}</div><div class="lbl">Total Posts</div></div>
+    <div class="stat"><div class="num">${c.new}</div><div class="lbl">New</div></div>
+    <div class="stat"><div class="num">${c.saved}</div><div class="lbl">Saved</div></div>
+    <div class="stat"><div class="num">${c.contacted}</div><div class="lbl">Contacted</div></div>`;
+}
+
+function esc(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+const PAGE_SIZE=20, PG={jobs:1,posts:1,startups:1}, PSIG={};
+function pageSlice(key,arr,sig){
+  if(PSIG[key]!==sig){ PSIG[key]=sig; PG[key]=1; }
+  const pages=Math.max(1,Math.ceil(arr.length/PAGE_SIZE)); if(PG[key]>pages) PG[key]=pages;
+  return arr.slice((PG[key]-1)*PAGE_SIZE, PG[key]*PAGE_SIZE);
+}
+function pagerHtml(key,total,fn){
+  const pages=Math.max(1,Math.ceil(total/PAGE_SIZE)); if(pages<=1) return '';
+  const p=PG[key];
+  return `<div style="display:flex;gap:10px;align-items:center;justify-content:center;margin:12px 0">
+    <button class="sec" ${p<=1?'disabled':''} onclick="goPage('${key}',-1,'${fn}')">← Prev</button>
+    <span style="font-size:13px">Page ${p} of ${pages} · ${total} results</span>
+    <button class="sec" ${p>=pages?'disabled':''} onclick="goPage('${key}',1,'${fn}')">Next →</button></div>`;
+}
+function goPage(key,d,fn){ PG[key]+=d; window[fn](); window.scrollTo({top:0,behavior:'smooth'}); }
+function statusBadge(s){ return `<span class="badge s${s[0]}">${esc(s.toUpperCase())}</span>`; }
+
+function renderJobs(){
+  const q   = document.getElementById('q').value.toLowerCase();
+  const st  = document.getElementById('stFilter').value;
+  const cat = document.getElementById('catFilter').value;
+  const src = document.getElementById('srcFilter').value;
+  const minScore = parseInt(document.getElementById('scoreFilter').value)||0;
+  const lk  = document.getElementById('linkFilter').value;
+
+  const f = allJobs.filter(j=>{
+    if(j.status==='deleted' && st!=='deleted') return false;
+    if(st!=='all' && j.status!==st) return false;
+    if(cat!=='all' && j.role_category!==cat) return false;
+    if(src!=='all' && !j.discovery_source.toLowerCase().includes(src)) return false;
+    if(minScore && j.match_score < minScore) return false;
+    if(lk!=='all' && (j.link_type||'direct')!==lk) return false;
+    if(q){
+      const hay=`${j.company} ${j.title} ${j.location} ${j.match_reason} ${j.discovery_source} ${j.salary}`.toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  const el=document.getElementById('jobs');
+  if(!f.length){ el.innerHTML='<div class="job"><div class="sub">No jobs match current filter.</div></div>'; return; }
+
+  const jobsPage=pageSlice('jobs',f,[q,st,cat,src,minScore,lk].join('|'));
+  el.innerHTML=pagerHtml('jobs',f.length,'renderJobs')+jobsPage.map(j=>`
+<div class="job">
+  <div class="jt">
+    <div>
+      <div class="job-title">${esc(j.title)}</div>
+      <div class="company">${esc(j.company)}</div>
+      ${(j.founder_name||j.founder_linkedin||j.founder_email)?`
+      <div class="founder-row">
+        👤 ${esc(j.founder_name||'Hiring Contact')}
+        ${j.founder_linkedin?`· <a href="${esc(j.founder_linkedin)}" target="_blank" style="color:#93c5fd">LinkedIn ↗</a>`:''}
+        ${j.founder_email?`· <a href="mailto:${esc(j.founder_email)}" style="color:#93c5fd">${esc(j.founder_email)}</a>`:''}
+        ${j.hiring_post_url?`· <a href="${esc(j.hiring_post_url)}" target="_blank" style="color:#93c5fd">Post ↗</a>`:''}
+      </div>`:''}
+    </div>
+    <div class="badges">
+      <span class="badge score">⭐ ${j.match_score}/10</span>
+      <span class="badge ${j.link_type==='email'?'board':'direct'}">${j.link_type==='email'?'✉ apply by email':'✅ direct link'}</span>
+      ${j.locked?'<span class="badge lock">🔒 may need login</span>':''}
+      <span class="badge">${esc(j.role_category)}</span>
+      ${statusBadge(j.status)}${outreachBadge('job',j.id)}
+      <span class="badge ${srcClass(j.discovery_source)}" style="font-size:10px">${esc(j.discovery_source.split(':')[0])}</span>
+    </div>
+  </div>
+  <div class="meta">
+    <span>📍 ${esc(j.location||'Remote')}</span>
+    <span>🧑‍💻 ${esc(j.experience_req||'not stated')}</span>
+    ${j.salary?`<span>💰 ${esc(j.salary)}</span>`:''}
+    ${j.posted_date?`<span>📅 ${esc(j.posted_date)}</span>`:''}
+  </div>
+  <div class="reason">${esc(j.match_reason)}</div>
+  ${jobPeople(j)}
+  ${j.notes?`<div class="notes">${esc(j.notes)}</div>`:''}
+  <div class="actions">
+    ${j.link_type==='email'
+      ? `<a class="apply-btn" href="mailto:${esc(j.apply_email)}?subject=${encodeURIComponent('Application: '+j.title)}">✉ Email ${esc(j.apply_email)}</a>`
+      : `<a class="apply-btn" href="${esc(j.direct_apply_url)}" target="_blank" rel="noopener">Direct Apply ↗</a>${j.apply_email?`<a class="view-btn" href="mailto:${esc(j.apply_email)}">✉ ${esc(j.apply_email)}</a>`:''}`}
+    ${j.link_status==='unverified'?'<span class="badge">couldn\'t verify page is live</span>':''}
+    ${reachBtn('job',j.id)}
+    <button class="ok"   onclick="setJobStatus(${j.id},'applied')">✓ Applied</button>
+    <button class="warn" onclick="setJobStatus(${j.id},'saved')">★ Save</button>
+    <button class="bad"  onclick="setJobStatus(${j.id},'rejected')">✗ Reject</button>
+    <button class="sec"  onclick="setJobStatus(${j.id},'deleted')" title="Remove from the dashboard">🗑 Delete</button>
+  </div>
+</div>`).join('')+pagerHtml('jobs',f.length,'renderJobs');
+}
+
+function renderPosts(){
+  const q   = document.getElementById('pq').value.toLowerCase();
+  const src = document.getElementById('pSrcFilter').value;
+  const st  = document.getElementById('pStFilter').value;
+
+  const f = allPosts.filter(p=>{
+    if(p.status==='deleted' && st!=='deleted') return false;
+    if(st!=='all' && p.status!==st) return false;
+    if(src!=='all' && !p.source.includes(src)) return false;
+    if(q){
+      const hay=`${p.poster_name} ${p.poster_role} ${p.post_text} ${p.skills_found}`.toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  const el=document.getElementById('posts');
+  if(!f.length){ el.innerHTML='<div class="post"><div class="sub">No posts match current filter.</div></div>'; return; }
+
+  const postsPage=pageSlice('posts',f,[q,src,st].join('|'));
+  el.innerHTML=pagerHtml('posts',f.length,'renderPosts')+postsPage.map(p=>`
+<div class="post">
+  <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;">
+    <div class="post-src">${esc(p.source)}${p.posted_at?' · '+esc(p.posted_at):''}</div>
+    <div class="badges">${statusBadge(p.status)}${outreachBadge('post',p.id)}</div>
+  </div>
+  <div class="post-name">${esc(p.poster_name||'Anonymous')}</div>
+  <div class="post-role">${esc(p.poster_role)}</div>
+  ${p.skills_found?`<div class="post-skills">🛠 ${esc(p.skills_found)}</div>`:''}
+  ${p.location?`<div style="font-size:11px;color:var(--muted)">📍 ${esc(p.location)}</div>`:''}
+  <div class="post-body" id="pb${p.id}">${esc(p.post_text)}</div>
+  <div class="pactions">
+    <a class="view-btn" href="${esc(p.post_url)}" target="_blank" rel="noopener">View Post ↗</a>
+    ${p.poster_url&&p.poster_url!==p.post_url?`<a class="view-btn" href="${esc(p.poster_url)}" target="_blank">Profile ↗</a>`:''}
+    ${reachBtn('post',p.id)}
+    <button class="ok"   onclick="setPStatus(${p.id},'contacted')" style="font-size:12px">✉ Contacted</button>
+    <button class="warn" onclick="setPStatus(${p.id},'saved')"     style="font-size:12px">★ Save</button>
+    <button class="sec"  onclick="document.getElementById('pb${p.id}').classList.toggle('exp')" style="font-size:12px">▼ More</button>
+    <button class="sec"  onclick="setPStatus(${p.id},'deleted')" style="font-size:12px">🗑 Delete</button>
+  </div>
+</div>`).join('')+pagerHtml('posts',f.length,'renderPosts');
+}
+
+/* ─── cold reach-out composer ─── */
+let CMP_CFG=null, OUTREACH=[], CMP={};
+const IS_STATIC = typeof window.__jhNote === 'function';          // the GitHub Pages copy (no server behind it)
+async function loadOutreach(){
+  if(IS_STATIC){ try{ OUTREACH=JSON.parse(localStorage.getItem('jh_outreach')||'[]'); }catch(e){ OUTREACH=[]; } return; }
+  try{ const d=await (await fetch('/api/outreach')).json(); OUTREACH=Array.isArray(d)?d:[]; }catch(e){ OUTREACH=[]; } }
+/* cloud composer: encrypted request → GitHub Actions → encrypted result on the `compose` branch */
+function ghRepo(){ const saved=localStorage.getItem('jh_gh_repo'); if(saved) return saved;
+  const owner=location.hostname.split('.')[0], name=location.pathname.split('/').filter(Boolean)[0]||'job-hunter';
+  return owner+'/'+name; }
+function cloudReady(){ return IS_STATIC && !!localStorage.getItem('jh_gh_token') && !!localStorage.getItem('jh_compose_key'); }
+function saveCloudSetup(){
+  const t=document.getElementById('cmpGhTok').value.trim(), k=document.getElementById('cmpKey').value.trim();
+  if(t) localStorage.setItem('jh_gh_token',t); if(k) localStorage.setItem('jh_compose_key',k);
+  document.getElementById('cmpCloud').className='cmp-cloud';
+  openCompose(CMP.type,CMP.id,true);
+}
+function toggleCloudSetup(){ const c=document.getElementById('cmpCloud'); c.className=c.className.includes('show')?'cmp-cloud':'cmp-cloud show';
+  document.getElementById('cmpRepoName').textContent=ghRepo(); }
+const _b64=u=>btoa(String.fromCharCode(...u)), _unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function _ckKey(pass,salt,iter){ const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']); }
+async function ckEnc(obj,pass){ const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12)), iter=100000;
+  const k=await _ckKey(pass,salt,iter); const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,new TextEncoder().encode(JSON.stringify(obj))));
+  return JSON.stringify({v:1,iter,salt:_b64(salt),iv:_b64(iv),ct:_b64(ct)}); }
+async function ckDec(b,pass){ const k=await _ckKey(pass,_unb64(b.salt),b.iter||250000);
+  return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:_unb64(b.iv)},k,_unb64(b.ct)))); }
+async function cloudCall(action,payload,onTick){
+  const tok=localStorage.getItem('jh_gh_token'), key=localStorage.getItem('jh_compose_key'), repo=ghRepo();
+  const req=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).toLowerCase();
+  const enc=await ckEnc({...payload,action,req},key);
+  const H={'Authorization':'Bearer '+tok,'X-GitHub-Api-Version':'2022-11-28'};
+  const r=await fetch(`https://api.github.com/repos/${repo}/actions/workflows/compose.yml/dispatches`,
+    {method:'POST',headers:{...H,'Accept':'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({ref:'main',inputs:{req,payload:enc}})});
+  if(r.status!==204) throw new Error(`GitHub didn't start the run (${r.status}): ${(await r.text()).slice(0,160)}`);
+  const t0=Date.now();
+  while(Date.now()-t0<12*60*1000){
+    await new Promise(res=>setTimeout(res,5000)); if(onTick) onTick(Math.round((Date.now()-t0)/1000));
+    const q=await fetch(`https://api.github.com/repos/${repo}/contents/results/${req}.json?ref=compose&_=${Date.now()}`,
+      {headers:{...H,'Accept':'application/vnd.github.raw+json'},cache:'no-store'});
+    if(q.status===200){ const blob=JSON.parse(await q.text()); return blob.ct ? await ckDec(blob,key) : blob; }
+    if(q.status===401||q.status===403) throw new Error('GitHub token rejected ('+q.status+'): check its permissions');
+  }
+  throw new Error('no result after 12 minutes: look at the "Cold email composer" runs in the repo\'s Actions tab');
+}
+function outreachFor(type,id){ return OUTREACH.find(o=>o.ref_type===type && String(o.ref_id)===String(id)); }
+function outreachBadge(type,id){ const o=outreachFor(type,id); if(!o) return '';
+  return `<span class="badge sa" title="${esc(o.subject)} → ${esc(o.to_email)}">✉ ${o.mode==='sent'?'emailed':'draft'} ${esc((o.at||'').slice(5,10))}</span>`; }
+function reachBtn(type,id){ return `<button class="purple" onclick="openCompose('${type}','${esc(String(id))}')" title="Write and send a cold email for this">✉ Cold reach-out</button>`; }
+const EMAIL_RE=/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+function firstEmail(t){ const m=(t||'').match(EMAIL_RE)||[]; return m.find(e=>!/(example|domain|email)\.com$|\.(png|jpg|gif)$/i.test(e))||''; }
+function guessType(role){ const r=(role||'').toLowerCase();
+  if(/founder|\bceo\b|\bcto\b|owner|director/.test(r)) return 'founder';
+  if(/recruit|talent|\bhr\b|human resources|people|hiring|acquisition/.test(r)) return 'recruiter';
+  return 'recruiter'; }
+function firstName(n){ n=(n||'').trim(); if(!n||/anonymous|^u\/|^@/i.test(n)) return ''; return n.split(/\s+/)[0].replace(/[^A-Za-zÀ-ɏ'-]/g,''); }
+
+async function openCompose(type,id,keep){
+  if(!CMP_CFG){ try{ CMP_CFG=IS_STATIC?{}:await (await fetch('/api/compose/config')).json(); }catch(e){ CMP_CFG={}; } }
+  const local=!!CMP_CFG.local, cloud=cloudReady();
+  if(keep){ applyComposeState(local,cloud); return; }
+  let d={company:'',role:'',link:'',type:'recruiter',name:'',to:'',context:''};
+  if(type==='job'){ const j=allJobs.find(x=>String(x.id)===String(id)); if(!j) return;
+    d={company:j.company,role:j.title,link:j.direct_apply_url,type:j.founder_email&&!j.apply_email?'founder':'recruiter',
+       name:j.founder_email&&!j.apply_email?firstName(j.founder_name):'', to:j.apply_email||j.founder_email||'',
+       context:[`${j.title} at ${j.company}`, j.location&&('Location: '+j.location), j.experience_req&&('Experience: '+j.experience_req), j.salary&&('Salary: '+j.salary), j.match_reason].filter(Boolean).join('\n')};
+  } else if(type==='post'){ const p=allPosts.find(x=>String(x.id)===String(id)); if(!p) return;
+    const isCo=/company page|^@|hiring$/i.test(p.poster_role||'') || /^[a-z0-9.-]+$/.test(p.poster_name||'');   // a company account, not a person
+    d={company:isCo?(p.poster_name||''):'',role:'',link:p.post_url,type:guessType(p.poster_role),name:isCo?'':firstName(p.poster_name),to:firstEmail(p.post_text),
+       context:`Hiring post by ${p.poster_name||'someone'}${p.poster_role?' ('+p.poster_role+')':''} on ${p.source}:\n${p.post_text}`};
+  } else { const s=allStartups.find(x=>String(x.key)===String(id)); if(!s) return;
+    const dev=(s.roles&&s.roles.dev)||[], f=(s.founder_links||[])[0];
+    d={company:s.name,role:dev[0]?dev[0].title:'Software Engineer (React / Node.js)',link:dev[0]?dev[0].url:(s.careers||s.website||''),
+       type:'founder',name:f?firstName(f.name):'',to:((s.emails||[])[0]||{}).email||'',
+       context:[`${s.name}: ${s.description||''}`, s.sector&&('Sector: '+s.sector), s.funded_on&&(`Funding: ${s.amount||''} ${s.round||''} on ${s.funded_on}`), s.investors&&('Investors: '+s.investors), dev.length&&('Open developer roles: '+dev.map(r=>r.title).join(', '))].filter(Boolean).join('\n')};
+  }
+  CMP={type,id,context:d.context};
+  const g=x=>document.getElementById(x);
+  g('cmpCompany').value=d.company||''; g('cmpRole').value=d.role||''; g('cmpLink').value=d.link||'';
+  g('cmpType').value=d.type; g('cmpName').value=d.name||''; g('cmpTo').value=d.to||'';
+  g('cmpSubject').value=''; g('cmpBody').innerHTML=''; g('cmpFlags').className='cmp-flags'; g('cmpStatus').textContent='';
+  g('cmpModel').value=localStorage.getItem('jh_cmp_model')||CMP_CFG.model||'sonnet';
+  g('cmpEffort').value=localStorage.getItem('jh_cmp_effort')||CMP_CFG.effort||'medium';
+  applyComposeState(local,cloud);
+  checkRepeat();
+  g('cmp').classList.add('open');
+  (d.to?g('cmpName'):g('cmpTo')).focus();
+}
+function applyComposeState(local,cloud){
+  const g=x=>document.getElementById(x), note=g('cmpNote');
+  g('cmpFrom').textContent = CMP_CFG.from ? `${CMP_CFG.from_name||''} <${CMP_CFG.from}>` : (local?'set GMAIL_ADDRESS in .env':'your Gmail (from the GMAIL_ADDRESS repo secret)');
+  g('cmpResume').textContent = CMP_CFG.resume || 'your resume (from the ColdEmail kit)';
+  if(IS_STATIC && !cloud){ note.innerHTML='To write and send from this page, connect the cloud composer once. <a onclick="toggleCloudSetup()">Set it up</a>. Until then, use "Open in Gmail" or "Copy".'; note.className='cmp-note show'; }
+  else if(IS_STATIC){ note.innerHTML='Runs on GitHub Actions with your Claude plan and Gmail (about 2–3 min). <a onclick="toggleCloudSetup()">Cloud settings</a>'; note.className='cmp-note show'; }
+  else if(!CMP_CFG.can_send){ note.textContent='To send from here, add GMAIL_ADDRESS and GMAIL_APP_PASSWORD (a Gmail App Password) to .env and restart the dashboard. Until then use "Open in Gmail" or "Copy".'; note.className='cmp-note show'; }
+  else if(!CMP_CFG.can_generate){ note.textContent='Generate needs the Claude Code CLI and ~/ClaudeProjects/ColdEmail/CLAUDE.md on this Mac.'; note.className='cmp-note show'; }
+  else note.className='cmp-note';
+  g('cmpGen').disabled=!((local&&CMP_CFG.can_generate)||cloud);
+  g('cmpSend').disabled=g('cmpDraft').disabled=!((local&&CMP_CFG.can_send)||cloud);
+  g('cmpAttach').disabled=!(CMP_CFG.resume||cloud);
+}
+function closeCompose(){ document.getElementById('cmp').classList.remove('open'); }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape' && document.getElementById('cmp').classList.contains('open')) closeCompose(); });
+function checkRepeat(){
+  const to=document.getElementById('cmpTo').value.trim().toLowerCase(), w=document.getElementById('cmpWarn');
+  const prev=to && OUTREACH.find(o=>o.mode==='sent' && (o.to_email||'').toLowerCase()===to);
+  const same=outreachFor(CMP.type,CMP.id);
+  if(prev){ w.textContent=`You already emailed ${prev.to_email} on ${prev.at.slice(0,10)} ("${prev.subject}").`; w.className='cmp-warn show'; }
+  else if(same){ w.textContent=`You already ${same.mode==='sent'?'emailed':'drafted an email to'} ${same.to_email} for this on ${same.at.slice(0,10)}.`; w.className='cmp-warn show'; }
+  else w.className='cmp-warn';
+}
+async function generateEmail(){
+  const g=x=>document.getElementById(x), btn=g('cmpGen'), st=g('cmpGenStatus');
+  btn.disabled=true; const t0=Date.now(); btn.textContent='✨ Writing…';
+  const tick=IS_STATIC?null:setInterval(()=>{ st.textContent=`Researching the company and writing… ${Math.round((Date.now()-t0)/1000)} s`; },1000);
+  if(IS_STATIC) st.textContent='Starting a GitHub Actions run…';
+  try{
+    const body={company:g('cmpCompany').value, role:g('cmpRole').value, job_link:g('cmpLink').value, recipient_type:g('cmpType').value,
+      first_name:g('cmpName').value, to:g('cmpTo').value, context:(CMP.context||'').slice(0,4000), model:g('cmpModel').value, effort:g('cmpEffort').value};
+    const d = IS_STATIC
+      ? await cloudCall('generate', body, s=>{ st.textContent=`Running on GitHub Actions… ${s} s (usually 2–3 min)`; })
+      : await (await fetch('/api/compose/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok){ st.textContent='⚠️ '+(d.error||'failed'); return; }
+    g('cmpSubject').value=d.subject||''; g('cmpBody').innerHTML=d.body_html||'';
+    if(!g('cmpCompany').value && d.company) g('cmpCompany').value=d.company;
+    if(!g('cmpRole').value && d.role) g('cmpRole').value=d.role;
+    const fl=g('cmpFlags');
+    if((d.flags||[]).length || (d.sources||[]).length){
+      fl.innerHTML=(d.flags.length?'<b>Before you send</b><ul>'+d.flags.map(f=>`<li>${esc(f)}</li>`).join('')+'</ul>':'')+
+        (d.sources.length?'<div style="margin-top:4px">Sources: '+d.sources.map((u,i)=>`<a href="${esc(u)}" target="_blank" rel="noopener">${i+1}</a>`).join(' · ')+'</div>':'');
+      fl.className='cmp-flags show';
+    }
+    st.textContent=`Done in ${Math.round((Date.now()-t0)/1000)} s with ${d.model||''} ${d.effort?'('+d.effort+')':''}. Edit anything before sending.`;
+  }catch(e){ st.textContent='⚠️ '+e; }
+  finally{ if(tick) clearInterval(tick); btn.disabled=false; btn.textContent='✨ Generate again'; }
+}
+async function sendEmail(mode,confirmRepeat){
+  const g=x=>document.getElementById(x), st=g('cmpStatus');
+  const payload={mode, to:g('cmpTo').value.trim(), subject:g('cmpSubject').value.trim(), body_html:g('cmpBody').innerHTML,
+    attach_resume:g('cmpAttach').checked, company:g('cmpCompany').value, role:g('cmpRole').value, job_link:g('cmpLink').value,
+    recipient_type:g('cmpType').value, first_name:g('cmpName').value, ref:{type:CMP.type,id:CMP.id}, confirm_repeat:!!confirmRepeat};
+  if(/\[First name\]/i.test(g('cmpBody').innerText) && !confirm('The email still says "[First name]". Send anyway?')) return;
+  if(IS_STATIC && mode==='send' && !confirmRepeat){
+    const prev=OUTREACH.find(o=>o.mode==='sent' && (o.to_email||'').toLowerCase()===payload.to.toLowerCase());
+    if(prev && !confirm(`You already emailed ${prev.to_email} on ${prev.at.slice(0,10)}. Send again?`)) return;
+  }
+  g('cmpSend').disabled=g('cmpDraft').disabled=true; st.textContent=mode==='send'?'Sending…':'Saving to Gmail Drafts…';
+  try{
+    const d = IS_STATIC
+      ? await cloudCall(mode, payload, s=>{ st.textContent=`${mode==='send'?'Sending':'Saving the draft'} via GitHub Actions… ${s} s`; })
+      : await (await fetch('/api/compose/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
+    if(IS_STATIC && d.ok){
+      const log=JSON.parse(localStorage.getItem('jh_outreach')||'[]');
+      log.unshift({ref_type:CMP.type,ref_id:String(CMP.id),to_email:payload.to,subject:payload.subject,mode:d.mode,at:new Date().toISOString()});
+      localStorage.setItem('jh_outreach',JSON.stringify(log.slice(0,2000)));
+      if(d.mode==='sent' && (CMP.type==='post'||CMP.type==='startup'))
+        await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:CMP.type==='post'?Number(CMP.id):CMP.id,status:'contacted',type:CMP.type})});
+    }
+    if(d.repeat){ g('cmpSend').disabled=g('cmpDraft').disabled=false;
+      if(confirm(d.error+'. Send again?')) return sendEmail(mode,true); st.textContent='Not sent.'; return; }
+    if(!d.ok){ st.textContent='⚠️ '+(d.error||'failed'); g('cmpSend').disabled=g('cmpDraft').disabled=false; return; }
+    st.textContent = d.mode==='sent' ? `✅ Sent to ${payload.to}` : '✅ Saved in your Gmail Drafts';
+    await loadOutreach();
+    if(CMP.type==='post') await loadPosts(); else if(CMP.type==='startup') await loadStartups(); else renderJobs();
+    setTimeout(closeCompose,1400);
+  }catch(e){ st.textContent='⚠️ '+e; g('cmpSend').disabled=g('cmpDraft').disabled=false; }
+}
+function openInGmail(){
+  const g=x=>document.getElementById(x);
+  const u='https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(g('cmpTo').value.trim())+
+          '&su='+encodeURIComponent(g('cmpSubject').value)+'&body='+encodeURIComponent(g('cmpBody').innerText);
+  window.open(u,'_blank','noopener');
+}
+function copyEmail(){
+  const body=document.getElementById('cmpBody').cloneNode(true);
+  body.querySelectorAll('*').forEach(n=>{ n.removeAttribute('style'); n.removeAttribute('class'); });
+  const html=body.innerHTML, text=document.getElementById('cmpBody').innerText;
+  const h=e=>{ e.clipboardData.setData('text/html',html); e.clipboardData.setData('text/plain',text); e.preventDefault(); };
+  document.addEventListener('copy',h); const ok=document.execCommand('copy'); document.removeEventListener('copy',h);
+  if(!ok && navigator.clipboard && window.ClipboardItem)
+    navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([html],{type:'text/html'}),'text/plain':new Blob([text],{type:'text/plain'})})]);
+  document.getElementById('cmpStatus').textContent='Copied the body (links kept). Subject: '+document.getElementById('cmpSubject').value;
+}
+
+/* ─── who to contact: filtered LinkedIn people searches + on-demand "Find recruiters" ─── */
+const LI_INDIA='102713980';
+function liPeople(ids,kw,india){ const p=new URLSearchParams();
+  if(ids&&ids.length) p.set('currentCompany',JSON.stringify(ids)); if(india) p.set('geoUrn',JSON.stringify([LI_INDIA]));
+  p.set('keywords',kw); p.set('origin','FACETED_SEARCH'); return 'https://www.linkedin.com/search/results/people/?'+p.toString(); }
+function isIndiaLoc(l){ return /india|\(in\)|,\s*in\b|bengal|bangalore|hyderabad|mumbai|pune|chennai|delhi|gurgaon|gurugram|noida|kolkata|ahmedabad|kochi|jaipur|indore|chandigarh|coimbatore|mohali|trivandrum|karnataka|telangana|maharashtra|tamil|kerala|goa/i.test(l||''); }
+function smallCo(size){ const m=(size||'').match(/^(\d[\d,]*)/); return m ? (+m[1].replace(/,/g,''))<=200 : null; }   // "51-200 employees" → small; unknown → null
+function jobPeople(j){
+  const ids=j.li_ids||[], india=isIndiaLoc(j.location), co=j.company||'', pre=ids.length?'':`"${co}" `, where=india?' (India)':'';
+  const chips=[[`Recruiters at ${co}${where}`, liPeople(ids, pre+'recruiter OR "talent acquisition"', india)],
+               [`Engineering managers${where}`, liPeople(ids, pre+'"engineering manager" OR "head of engineering" OR "tech lead"', india)]];
+  const small=smallCo(j.li_size);
+  if(small!==false) chips.push([small?'Founders':'Founders (if a startup)', liPeople(ids, pre+'founder OR co-founder OR CEO OR CTO', false)]);
+  let prof=[]; try{ prof=JSON.parse(j.contacts||'[]').filter(c=>c.kind==='profile'); }catch(e){}
+  return `<div class="contacts"><span class="clabel" title="${ids.length?'Filtered to the company\'s LinkedIn page'+(j.li_size?' ('+esc(j.li_size)+')':''):'Company page not matched yet: searching by name'}">👥 LinkedIn${ids.length?'':' (by name)'}:</span>`+
+    chips.map(([l,u])=>`<a class="chip" href="${esc(u)}" target="_blank" rel="noopener">${esc(l)} ↗</a>`).join('')+
+    prof.map(c=>`<a class="chip" href="${esc(c.url)}" target="_blank" rel="noopener" title="${esc(c.note)}">${c.role==='Company page'?'Company page':esc(c.role)+': '+esc(c.name||'profile')} ↗</a>`).join('')+
+    `<button class="chip-btn" onclick="findRecruiters(${j.id})" title="One Google search (1 Serper credit) for this company's recruiters">🔎 Find recruiters</button></div>`+
+    `<div class="recs" id="rec${j.id}"></div>`;
+}
+const REC_TTL=30*864e5;
+async function findRecruiters(id){
+  const j=allJobs.find(x=>x.id===id); if(!j) return; const box=document.getElementById('rec'+id);
+  const ck=(j.company||'').toLowerCase().replace(/[^a-z0-9]/g,'')+'|'+(j.location||'').toLowerCase().slice(0,40);
+  let cache={}; try{ cache=JSON.parse(localStorage.getItem('jh_recruiters')||'{}'); }catch(e){}
+  if(cache[ck] && Date.now()-cache[ck].t<REC_TTL) return showRecruiters(box,cache[ck].d,j,true);
+  if(IS_STATIC && !cloudReady()){ box.innerHTML='<div class="notes">Connect the cloud composer first: ✉ Cold reach-out → Set it up.</div>'; return; }
+  box.innerHTML='<div class="notes">🔎 Searching…</div>';
+  try{
+    const body={company:j.company, location:j.location||''};
+    const d = IS_STATIC
+      ? await cloudCall('recruiters', body, s=>{ box.innerHTML=`<div class="notes">🔎 Searching via GitHub Actions… ${s} s</div>`; })
+      : await (await fetch('/api/recruiters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok){ box.innerHTML=`<div class="notes">⚠️ ${esc(d.error||'failed')}</div>`; return; }
+    cache[ck]={t:Date.now(),d}; localStorage.setItem('jh_recruiters',JSON.stringify(cache));
+    showRecruiters(box,d,j,false);
+  }catch(e){ box.innerHTML=`<div class="notes">⚠️ ${esc(String(e.message||e))}</div>`; }
+}
+function showRecruiters(box,d,j,cached){
+  const head=`<div class="notes">Recruiters / talent acquisition at ${esc(j.company)}${d.city?' · '+esc(d.city):''}${cached?' · saved result':''}${d.credits_left!=null?` · ${d.credits_left} searches left`:''}</div>`;
+  if(!(d.people||[]).length){ box.innerHTML=head+`<div class="notes">Google found nobody matching. Use the LinkedIn links above.</div>`; return; }
+  box.innerHTML=head+d.people.map(p=>`<div class="rec-row"><a href="${esc(p.url)}" target="_blank" rel="noopener" title="Opens their LinkedIn profile"><b>${esc(p.name)}</b></a>
+    <span>${esc(p.title)}</span>
+    <a class="chip search" href="${esc(p.search_url)}" target="_blank" rel="noopener" title="If the profile link doesn't open, search their name on LinkedIn">search ↗</a>
+    <button class="chip-btn" data-job="${j.id}" data-name="${esc(firstName(p.name))}" onclick="writeTo(this)">✉ Write</button></div>`).join('');
+}
+async function writeTo(btn){
+  await openCompose('job', btn.dataset.job);
+  document.getElementById('cmpName').value=btn.dataset.name||''; document.getElementById('cmpType').value='recruiter';
+}
+
+async function setJobStatus(id,s){
+  await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,status:s,type:'job'})});
+  await loadJobs();
+}
+async function setPStatus(id,s){
+  await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,status:s,type:'post'})});
+  await loadPosts();
+}
+
+async function pollScan(){
+  const banner=document.getElementById('scanBanner');
+  try{
+    const r=await fetch('/api/scan-status'); const d=await r.json();
+    if(d.running){
+      banner.style.display='block';
+      banner.textContent='⏳ Scan running — '+(d.stage||'working')+' … results appear here automatically.';
+      await loadJobs(); await loadPosts();
+      return true;
+    }
+    banner.style.display='none';
+  }catch(e){}
+  return false;
+}
+let scanTimer=null;
+function watchScan(){
+  if(scanTimer) return;
+  scanTimer=setInterval(async()=>{
+    const running=await pollScan();
+    if(!running){
+      clearInterval(scanTimer); scanTimer=null;
+      document.getElementById('scanAllBtn').textContent='🔍 Scan Now';
+      document.getElementById('scanAllBtn').disabled=false;
+      const r=await fetch('/api/scan-status'); const d=await r.json();
+      await refresh();
+      if(d.summary && !d.summary.error){
+        const m=d.summary;
+        alert(`✅ Scan complete!\n• ${m.jobs_added} new jobs (${m.direct_links||0} direct, ${m.board_links||0} board links)\n• ${m.posts_added} new posts\n• ${m.duplicates_skipped} already seen\n• Total in DB: ${m.total_jobs_in_db}`);
+      }
+    }
+  },3000);
+}
+async function triggerScan(){
+  const st=document.getElementById('scanStatus');
+  const raw=document.getElementById('customUrls').value.trim();
+  const urls=raw?raw.split('\n').map(s=>s.trim()).filter(Boolean):null;
+  const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});
+  const d=await r.json();
+  st.textContent=d.started?'⏳ Scan started…':'A scan is already running';
+  watchScan();
+}
+async function triggerAutoScan(){
+  const btn=document.getElementById('scanAllBtn');
+  btn.textContent='⏳ Scanning…'; btn.disabled=true;
+  await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls:null})});
+  watchScan();
+}
+
+{ let t0=''; try{ t0=(location.hash||'').slice(1)||localStorage.getItem('jh_tab')||''; }catch(e){}
+  if(['jobs','posts','startups'].includes(t0)) switchTab(t0); }      // a refresh stays on the tab you were on
+refresh();
+pollScan().then(r=>{ if(r) watchScan(); });
+setInterval(()=>{ if(!scanTimer) refresh(); }, 60000);   // auto-refresh so new jobs show up without a reload
+</script>
+</body>
+</html>
