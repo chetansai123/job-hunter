@@ -7841,7 +7841,31 @@ def compose_run(out_path: str) -> None:
     g["DB_PATH"] = tmp / "compose.db"                 # throwaway: the outreach log lives in your browser, not the public repo
     init_db()
     action = p.get("action")
-    if action == "generate":
+    if action == "check":                              # setup test: log in to Gmail and ask Claude one word, send nothing
+        res = {"ok": True, "gmail": "", "claude": ""}
+        try:
+            import smtplib
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as sm:
+                sm.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            res["gmail"] = "ok"
+        except Exception as e:
+            res["gmail"] = f"{type(e).__name__}: {str(e)[:160]}"
+        import subprocess
+        tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        shape = "sk-ant-oat token" if re.fullmatch(r"sk-ant-oat\d\d-[A-Za-z0-9_-]{20,}", tok) else \
+                f"not a valid token shape ({len(tok)} chars, starts '{tok[:7]}', non-ASCII: {any(ord(c) > 127 for c in tok)})"
+        try:
+            r = subprocess.run([_claude_bin() or "claude", "-p", "Reply with the word ok", "--model", "haiku",
+                                "--no-session-persistence", "--output-format", "json"], capture_output=True, text=True, timeout=120,
+                               stdin=subprocess.DEVNULL)
+            o = json.loads(r.stdout or "{}")
+            res["claude"] = "ok" if not o.get("is_error") and o.get("result") else f"{(o.get('result') or r.stderr or '')[:160]}"
+        except Exception as e:
+            res["claude"] = f"{type(e).__name__}: {str(e)[:160]}"
+        res["claude_token"] = shape
+        res["gmail_address"] = re.sub(r"^(.).*(.)@", r"\1***\2@", GMAIL_ADDRESS)
+        res["gmail_password_len"] = len(GMAIL_APP_PASSWORD)
+    elif action == "generate":
         res = generate_cold_email(p)
     elif action in ("send", "draft"):
         res = send_cold_email({**p, "mode": action, "confirm_repeat": True})   # repeat check runs in the browser
