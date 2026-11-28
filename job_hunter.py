@@ -285,6 +285,9 @@ def init_db() -> None:
             akey TEXT NOT NULL, post_url TEXT NOT NULL, hiring INTEGER, at TEXT,
             PRIMARY KEY (akey, post_url)
         );
+        CREATE TABLE IF NOT EXISTS li_people_pages (    -- LinkedIn company page id(s) per company → filtered people searches
+            ckey TEXT PRIMARY KEY, ids TEXT, size TEXT, slug TEXT, at TEXT
+        );
         CREATE TABLE IF NOT EXISTS outreach (           -- cold emails sent / drafted from the dashboard composer
             id INTEGER PRIMARY KEY AUTOINCREMENT, ref_type TEXT, ref_id TEXT, company TEXT, role TEXT, job_link TEXT,
             to_email TEXT, recipient_type TEXT, first_name TEXT, subject TEXT, mode TEXT, at TEXT
@@ -4813,6 +4816,159 @@ def build_contacts(conn: sqlite3.Connection, company: str, use_search: bool = Tr
     return contacts
 
 
+# ── who to contact: LinkedIn company IDs (filtered people-search links) + on-demand "Find recruiters" ──────────
+#  The job card's LinkedIn links open a people search already filtered to the company (its LinkedIn ID, read from the
+#  public company page — no login) and to India (geoUrn 102713980). Big companies can have several pages
+#  (NTT DATA: 18535 and 19126858) → every page whose name matches is included. Size decides the "Founders" link.
+LI_INDIA_GEO = "102713980"
+LI_LOOKUPS_PER_SCAN = int(os.environ.get("LI_LOOKUPS_PER_SCAN", "40"))
+
+
+def _li_company_page(slug: str) -> dict | None:
+    h = http_get_text(f"https://www.linkedin.com/company/{urllib.parse.quote(slug)}", timeout=20, quiet=True)
+    if not h:
+        return None
+    t = re.search(r'<meta property="og:title" content="([^"]+)"', h)
+    ids = re.findall(r"urn:li:(?:organization|company|fsd_company):(\d+)", h)
+    if not t or not ids:
+        return None
+    name = htmllib.unescape(t.group(1)).rsplit(" | LinkedIn", 1)[0].strip()
+    size = re.search(r"Company size.{0,300}?<dd[^>]*>\s*([^<]+?)\s*<", h, re.S)
+    return {"slug": slug, "id": max(set(ids), key=ids.count), "name": name, "size": (size.group(1).strip() if size else "")}
+
+
+def _li_same_company(a: str, b: str) -> bool:
+    ka, kb = _company_key(a), _company_key(b)
+    if not ka or not kb:
+        return False
+    return ka == kb or (min(len(ka), len(kb)) >= 5 and (ka.startswith(kb) or kb.startswith(ka)))
+
+
+def li_company_lookup(company: str) -> dict:
+    """{ids: [...], size, slug} for the company's LinkedIn page(s); ids empty when none matches the name."""
+    slugs: list[str] = []
+    for c in _slug_candidates(company) + [re.sub(r"[^a-z0-9]+", "-", (company or "").lower()).strip("-")]:
+        if c and c not in slugs:
+            slugs.append(c)
+    found: list[dict] = []
+    for s in slugs[:5]:
+        pg = _li_company_page(s)
+        time.sleep(1.2)                                   # polite: LinkedIn answers 429 to bursts
+        if pg and _li_same_company(pg["name"], company) and pg["id"] not in [f["id"] for f in found]:
+            found.append(pg)
+    return {"ids": [f["id"] for f in found][:3], "size": next((f["size"] for f in found if f["size"]), ""),
+            "slug": found[0]["slug"] if found else ""}
+
+
+def enrich_li_companies(limit: int = LI_LOOKUPS_PER_SCAN) -> int:
+    """Look up the LinkedIn page of companies with open jobs (new / saved), a few per scan; retried after 30 days."""
+    conn = get_db()
+    have = {r["ckey"]: r for r in conn.execute("SELECT ckey, ids, at FROM li_people_pages")}
+    todo, seen = [], set()
+    for r in conn.execute("SELECT DISTINCT company FROM jobs WHERE status IN ('new','saved') AND link_type!='board'"):
+        k = _company_key(r["company"])
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        h = have.get(k)
+        if h and (h["ids"] not in ("", "[]") or (days_ago(h["at"]) or 0) < 30):
+            continue
+        todo.append((k, r["company"]))
+    conn.close()
+    done = 0
+    for k, name in todo[:limit]:
+        try:
+            info = li_company_lookup(name)
+        except Exception:
+            continue
+        c = get_db()
+        c.execute("INSERT OR REPLACE INTO li_people_pages (ckey, ids, size, slug, at) VALUES (?,?,?,?,?)",
+                  (k, json.dumps(info["ids"]), info["size"], info["slug"], now_utc()))
+        c.commit(); c.close()
+        done += 1
+    print(f"[linkedin pages] looked up {done} companies ({len(todo) - done} left for later scans)")
+    return done
+
+
+def attach_li(conn: sqlite3.Connection, jobs: list[dict]) -> list[dict]:
+    m = {r["ckey"]: r for r in conn.execute("SELECT ckey, ids, size, slug FROM li_people_pages")}
+    for j in jobs:
+        r = m.get(_company_key(j.get("company", "")))
+        j["li_ids"] = json.loads(r["ids"]) if r and r["ids"] else []
+        j["li_size"] = r["size"] if r else ""
+        j["li_slug"] = r["slug"] if r else ""
+    return jobs
+
+
+_TA_WORDS = re.compile(r"recruit|talent|acquisition|\bhr\b|human resources|people partner|people operations|hiring|staffing", re.I)
+_TA_RANK = [(re.compile(r"technical recruiter|tech recruiter|it recruiter|engineering recruiter", re.I), 0),
+            (re.compile(r"\bhead\b|director|\bvp\b|vice president|chief|global", re.I), 4),     # leaders: last resort
+            (re.compile(r"talent acquisition (?:specialist|partner|executive|associate|consultant|lead)|recruiter", re.I), 1),
+            (re.compile(r"talent acquisition", re.I), 2),
+            (re.compile(r"\bhr\b|human resources|people", re.I), 3)]
+
+
+def _job_city(location: str, rules: dict) -> tuple[bool, str]:
+    """(is_india, first Indian city/state named in the location)."""
+    l = (location or "").lower()
+    places = rules.get("locations", {}).get("india_places", [])
+    hits = sorted(((m.start(), p) for p in places for m in [re.search(r"(?<![a-z])" + re.escape(p) + r"(?![a-z])", l)] if m),
+                  key=lambda x: x[0])
+    city = next((p for _, p in hits if p not in ("india", "across india", "all india", "pan india")), "")
+    return bool(hits) or bool(re.search(r"\bindia\b|\(in\)", l)), city.title()
+
+
+def find_recruiters(p: dict) -> dict:
+    """One Serper (Google) search for the company's recruiters / TA team in the job's city. Spends 1 search credit."""
+    company = (p.get("company") or "").strip()
+    if not company:
+        return {"ok": False, "error": "no company name"}
+    if not SERPER_API_KEY:
+        return {"ok": False, "error": "SERPER_API_KEY is not set here (it is a GitHub secret: use the dashboard on GitHub Pages)"}
+    india, city = _job_city(p.get("location", ""), load_rules())
+    name_q = re.sub(r",?\s*\b(inc|llc|ltd|limited|pvt|private|corp|corporation|co)\b\.?", "", company, flags=re.I).strip(" ,.")
+    q = (f'site:{"in." if india else ""}linkedin.com/in ("talent acquisition" OR recruiter OR "technical recruiter") '
+         f'"{name_q}"' + (f" {city}" if city else ""))
+    try:
+        req = urllib.request.Request("https://google.serper.dev/search", method="POST",
+                                     data=json.dumps({"q": q, "gl": "in" if india else "us", "num": 10}).encode(),
+                                     headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode())
+    except Exception as e:
+        return {"ok": False, "error": f"search failed: {str(e)[:120]}"}
+    ckey = re.sub(r"[^a-z0-9]", "", _company_key(company))
+    people, seen = [], set()
+    for x in res.get("organic", []):
+        title, snip, link = x.get("title", ""), x.get("snippet", ""), x.get("link", "")
+        name, _, headline = title.partition(" - ")
+        name = name.strip()
+        headline = re.sub(r"\s*\|\s*LinkedIn.*$", "", headline).strip(" .|")
+        blob = f"{title} {snip}"
+        if not name or name.lower() in seen or len(name) > 60:
+            continue
+        if ckey and ckey not in re.sub(r"[^a-z0-9]", "", blob.lower()):
+            continue                                         # someone at another company
+        if not _TA_WORDS.search(blob):
+            continue
+        if re.search(r"\b(?:ex|former|formerly|previously)\b[\s-]*(?:@|at\s+)?" + re.escape(name_q.split()[0]), blob, re.I):
+            continue                                         # used to work there
+        rank = next((rk for rx, rk in _TA_RANK if rx.search(headline or blob)), 5)
+        seen.add(name.lower())
+        people.append({"name": name, "title": headline[:110], "url": link, "rank": rank,
+                       "search_url": "https://www.linkedin.com/search/results/people/?" +
+                                     urllib.parse.urlencode({"keywords": f"{name} {name_q}"})})
+    people.sort(key=lambda d: d["rank"])
+    credits = None
+    try:
+        with urllib.request.urlopen(urllib.request.Request("https://google.serper.dev/account",
+                                                           headers={"X-API-KEY": SERPER_API_KEY}), timeout=15) as r:
+            credits = json.loads(r.read().decode()).get("balance")
+    except Exception:
+        pass
+    return {"ok": True, "people": people[:8], "city": city, "india": india, "query": q, "credits_left": credits}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  RE-VETTING STORED RESULTS  (still live? still passes every rule? direct link found?)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5179,7 +5335,7 @@ def export_static(outdir: str) -> bool:
     """Write index.html + data.enc.json (+ vercel.json / robots.txt) to `outdir`."""
     password = os.environ.get("DASH_PASSWORD", "")      # empty → open (unencrypted) dashboard
     conn = get_db()
-    jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")]
+    jobs = attach_li(conn, [dict(r) for r in conn.execute("SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC")])
     posts = [dict(r) for r in conn.execute("SELECT * FROM posts ORDER BY id DESC")]
     startups = [{**json.loads(r["data"]), "key": r["key"], "score": r["score"]} for r in conn.execute(
         "SELECT key, data, score, funded_on FROM startups ORDER BY score DESC, funded_on DESC LIMIT 8000")
@@ -5514,6 +5670,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
             revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.commit()
         revet_existing_posts(rules)                     # posts are re-judged with the current rules on every run
+        try:
+            enrich_li_companies()                       # LinkedIn company ids → filtered recruiter / manager searches on job cards
+        except Exception as exc:
+            print(f"  [!] LinkedIn company lookup failed: {exc}")
         conn = get_db()
         cut = 0
         for r in conn.execute("SELECT id, experience_req, title FROM jobs WHERE status NOT IN ('applied','saved')").fetchall():
@@ -6800,6 +6960,10 @@ a.apply-btn.board{background:#92400e;}
 #cmpStatus{font-size:12px;color:#5f6368;flex:1;min-width:160px;}
 .cmp-note{padding:8px 16px;background:#e8f0fe;color:#174ea6;font-size:12px;display:none;} .cmp-note.show{display:block;}
 .cmp-note a{color:#174ea6;font-weight:600;cursor:pointer;}
+button.chip-btn{font-size:11px;padding:2px 9px;border-radius:999px;background:#2a1a4a;color:#d8b4fe;border:1px solid #6d28d9;font-weight:600;}
+.recs:empty{display:none;} .recs{display:grid;gap:5px;margin-top:4px;padding:8px 10px;background:#0b1220;border:1px solid var(--border);border-radius:8px;}
+.rec-row{font-size:12px;display:flex;flex-wrap:wrap;gap:7px;align-items:center;color:#a8bdd4;}
+.rec-row a b{color:#93c5fd;}
 .cmp-ctx .gen select{padding:7px 8px;}
 .cmp-cloud{display:none;padding:10px 16px;background:#f8fafd;border-bottom:1px solid #e3e8ef;font-size:12px;color:#3c4043;gap:7px;}
 .cmp-cloud.show{display:grid;} .cmp-cloud input{background:#fff;color:#202124;border:1px solid #dadce0;border-radius:6px;padding:7px 9px;font-size:13px;}
@@ -7230,7 +7394,7 @@ function renderJobs(){
     ${j.posted_date?`<span>📅 ${esc(j.posted_date)}</span>`:''}
   </div>
   <div class="reason">${esc(j.match_reason)}</div>
-  ${renderContacts(j.contacts)}
+  ${jobPeople(j)}
   ${j.notes?`<div class="notes">${esc(j.notes)}</div>`:''}
   <div class="actions">
     ${j.link_type==='email'
@@ -7471,6 +7635,57 @@ function copyEmail(){
   if(!ok && navigator.clipboard && window.ClipboardItem)
     navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([html],{type:'text/html'}),'text/plain':new Blob([text],{type:'text/plain'})})]);
   document.getElementById('cmpStatus').textContent='Copied the body (links kept). Subject: '+document.getElementById('cmpSubject').value;
+}
+
+/* ─── who to contact: filtered LinkedIn people searches + on-demand "Find recruiters" ─── */
+const LI_INDIA='102713980';
+function liPeople(ids,kw,india){ const p=new URLSearchParams();
+  if(ids&&ids.length) p.set('currentCompany',JSON.stringify(ids)); if(india) p.set('geoUrn',JSON.stringify([LI_INDIA]));
+  p.set('keywords',kw); p.set('origin','FACETED_SEARCH'); return 'https://www.linkedin.com/search/results/people/?'+p.toString(); }
+function isIndiaLoc(l){ return /india|\(in\)|,\s*in\b|bengal|bangalore|hyderabad|mumbai|pune|chennai|delhi|gurgaon|gurugram|noida|kolkata|ahmedabad|kochi|jaipur|indore|chandigarh|coimbatore|mohali|trivandrum|karnataka|telangana|maharashtra|tamil|kerala|goa/i.test(l||''); }
+function smallCo(size){ const m=(size||'').match(/^(\d[\d,]*)/); return m ? (+m[1].replace(/,/g,''))<=200 : null; }   // "51-200 employees" → small; unknown → null
+function jobPeople(j){
+  const ids=j.li_ids||[], india=isIndiaLoc(j.location), co=j.company||'', pre=ids.length?'':`"${co}" `, where=india?' (India)':'';
+  const chips=[[`Recruiters at ${co}${where}`, liPeople(ids, pre+'recruiter OR "talent acquisition"', india)],
+               [`Engineering managers${where}`, liPeople(ids, pre+'"engineering manager" OR "head of engineering" OR "tech lead"', india)]];
+  const small=smallCo(j.li_size);
+  if(small!==false) chips.push([small?'Founders':'Founders (if a startup)', liPeople(ids, pre+'founder OR co-founder OR CEO OR CTO', false)]);
+  let prof=[]; try{ prof=JSON.parse(j.contacts||'[]').filter(c=>c.kind==='profile'); }catch(e){}
+  return `<div class="contacts"><span class="clabel" title="${ids.length?'Filtered to the company\'s LinkedIn page'+(j.li_size?' ('+esc(j.li_size)+')':''):'Company page not matched yet: searching by name'}">👥 LinkedIn${ids.length?'':' (by name)'}:</span>`+
+    chips.map(([l,u])=>`<a class="chip" href="${esc(u)}" target="_blank" rel="noopener">${esc(l)} ↗</a>`).join('')+
+    prof.map(c=>`<a class="chip" href="${esc(c.url)}" target="_blank" rel="noopener" title="${esc(c.note)}">${c.role==='Company page'?'Company page':esc(c.role)+': '+esc(c.name||'profile')} ↗</a>`).join('')+
+    `<button class="chip-btn" onclick="findRecruiters(${j.id})" title="One Google search (1 Serper credit) for this company's recruiters">🔎 Find recruiters</button></div>`+
+    `<div class="recs" id="rec${j.id}"></div>`;
+}
+const REC_TTL=30*864e5;
+async function findRecruiters(id){
+  const j=allJobs.find(x=>x.id===id); if(!j) return; const box=document.getElementById('rec'+id);
+  const ck=(j.company||'').toLowerCase().replace(/[^a-z0-9]/g,'')+'|'+(j.location||'').toLowerCase().slice(0,40);
+  let cache={}; try{ cache=JSON.parse(localStorage.getItem('jh_recruiters')||'{}'); }catch(e){}
+  if(cache[ck] && Date.now()-cache[ck].t<REC_TTL) return showRecruiters(box,cache[ck].d,j,true);
+  if(IS_STATIC && !cloudReady()){ box.innerHTML='<div class="notes">Connect the cloud composer first: ✉ Cold reach-out → Set it up.</div>'; return; }
+  box.innerHTML='<div class="notes">🔎 Searching…</div>';
+  try{
+    const body={company:j.company, location:j.location||''};
+    const d = IS_STATIC
+      ? await cloudCall('recruiters', body, s=>{ box.innerHTML=`<div class="notes">🔎 Searching via GitHub Actions… ${s} s</div>`; })
+      : await (await fetch('/api/recruiters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok){ box.innerHTML=`<div class="notes">⚠️ ${esc(d.error||'failed')}</div>`; return; }
+    cache[ck]={t:Date.now(),d}; localStorage.setItem('jh_recruiters',JSON.stringify(cache));
+    showRecruiters(box,d,j,false);
+  }catch(e){ box.innerHTML=`<div class="notes">⚠️ ${esc(String(e.message||e))}</div>`; }
+}
+function showRecruiters(box,d,j,cached){
+  const head=`<div class="notes">Recruiters / talent acquisition at ${esc(j.company)}${d.city?' · '+esc(d.city):''}${cached?' · saved result':''}${d.credits_left!=null?` · ${d.credits_left} searches left`:''}</div>`;
+  if(!(d.people||[]).length){ box.innerHTML=head+`<div class="notes">Google found nobody matching. Use the LinkedIn links above.</div>`; return; }
+  box.innerHTML=head+d.people.map(p=>`<div class="rec-row"><a href="${esc(p.url)}" target="_blank" rel="noopener" title="Opens their LinkedIn profile"><b>${esc(p.name)}</b></a>
+    <span>${esc(p.title)}</span>
+    <a class="chip search" href="${esc(p.search_url)}" target="_blank" rel="noopener" title="If the profile link doesn't open, search their name on LinkedIn">search ↗</a>
+    <button class="chip-btn" data-job="${j.id}" data-name="${esc(firstName(p.name))}" onclick="writeTo(this)">✉ Write</button></div>`).join('');
+}
+async function writeTo(btn){
+  await openCompose('job', btn.dataset.job);
+  document.getElementById('cmpName').value=btn.dataset.name||''; document.getElementById('cmpType').value='recruiter';
 }
 
 async function setJobStatus(id,s){
@@ -7867,6 +8082,8 @@ def compose_run(out_path: str) -> None:
         res["claude_token"] = shape
         res["gmail_address"] = re.sub(r"^(.).*(.)@", r"\1***\2@", GMAIL_ADDRESS)
         res["gmail_password_len"] = len(GMAIL_APP_PASSWORD)
+    elif action == "recruiters":
+        res = find_recruiters(p)
     elif action == "generate":
         res = generate_cold_email(p)
     elif action in ("send", "draft"):
@@ -7931,8 +8148,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE link_type!='board' ORDER BY match_score DESC, id DESC"
             ).fetchall()
+            out = attach_li(conn, [dict(r) for r in rows])
             conn.close()
-            self._json([dict(r) for r in rows])
+            self._json(out)
             return
 
         if path == "/api/meta":
@@ -8028,6 +8246,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/compose/generate":
             self._json(generate_cold_email(payload))
+            return
+
+        if self.path == "/api/recruiters":
+            self._json(find_recruiters(payload))
             return
 
         if self.path == "/api/compose/send":
