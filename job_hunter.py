@@ -23,6 +23,7 @@ CONTINUOUS LOOP:
 """
 
 import argparse
+import email.utils
 import hashlib
 import html as htmllib
 import json
@@ -276,6 +277,13 @@ def init_db() -> None:
 
         CREATE TABLE IF NOT EXISTS board_urls (
             url TEXT PRIMARY KEY, board TEXT, first_seen TEXT
+        );
+        CREATE TABLE IF NOT EXISTS gn_seen (            -- Google News items already looked at (decoded once, never re-fetched)
+            gid TEXT PRIMARY KEY, url TEXT, at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS author_posts (       -- rule 8b: every hiring-style post seen per author → job feeds stand out
+            akey TEXT NOT NULL, post_url TEXT NOT NULL, hiring INTEGER, at TEXT,
+            PRIMARY KEY (akey, post_url)
         );
         CREATE TABLE IF NOT EXISTS workday_boards (
             host     TEXT NOT NULL,
@@ -1211,7 +1219,7 @@ def post_dedup_key(post: dict) -> str:
     role = _ROLE_PHRASE.search(text)
     role_k = re.sub(r"[^a-z]+", "", role.group(1)) if role else ""
     mails = [m.group(0) for m in _MAIL_ANY.finditer(text) if not any(b in m.group(0) for b in _BAD_MAIL)]
-    if mails:
+    if mails and role_k:                               # same address + same role = same opening; address alone isn't (one HR mail, many roles)
         return f"mail:{mails[0]}|{role_k}"
     words = _post_words(text)
     return "txt:" + hashlib.md5(" ".join(words[:60]).encode()).hexdigest() if words else ""
@@ -1910,63 +1918,60 @@ def collect_hiring_sheet(rules: dict) -> list[dict]:
     return out
 
 
+def _ago_to_date(s: str) -> str:
+    m = re.search(r"(\d+)\s*(m|min|h|d|w|mo)\b", s or "")
+    if not m:
+        return ""
+    n, u = int(m.group(1)), m.group(2)
+    days = {"m": 0, "min": 0, "h": n / 24, "d": n, "w": n * 7, "mo": n * 30}[u]
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def collect_tal_club(rules: dict) -> list[dict]:
-    """jobsinthewild.tal.club — LinkedIn/X hiring posts straight from founders & in-house teams.
-    Page layout per post:  [author image/name/headline/time] [↗](/j/ID)  ### title + text + tags  [message boss ↗](post)"""
+    """jobsinthewild.tal.club — LinkedIn/X hiring posts straight from founders & in-house teams. The site is server-rendered,
+    so plain HTTP is enough (no Firecrawl). Each <article class="post-frame"> holds the author, the post body, tags and the
+    'message boss' link to the original post."""
     print("[tal.club] jobs-in-the-wild posts...")
     out, seen = [], set()
-    arrow = re.compile(r"\[↗\]\(https://jobsinthewild\.tal\.club/j/\d+\)")
-
-    def clean_lines(t: str) -> list[str]:
-        t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
-        return [l.strip() for l in t.splitlines() if l.strip()]
-
-    for qs in ("?sort=new&role_family=engineering", "?sort=new&role_family=ai-ml",
-               "?sort=new&remote_mode=remote", "?sort=new&seniority=junior", "?sort=new&seniority=mid"):
-        sc = fc_scrape("https://jobsinthewild.tal.club/" + qs)
-        md = (sc.get("markdown") or "") if isinstance(sc, dict) else ""
-        parts = arrow.split(md)
-        header = clean_lines(parts[0])[-3:] if parts else []
-        for k in range(1, len(parts)):
-            seg = parts[k]
-            body, sep, rest = seg.partition("[message boss ↗](")
-            if not sep:
-                header = []
+    strip = lambda h: htmllib.unescape(re.sub(r"<[^>]+>", " ", h or "")).strip()
+    for qs in ("?sort=new&role_family=engineering", "?sort=new&role_family=engineering&page=2", "?sort=new&role_family=ai-ml",
+               "?sort=new&remote_mode=remote", "?sort=new&seniority=junior", "?sort=new&seniority=mid", "?sort=new&seniority=mid&page=2"):
+        h = http_get_text("https://jobsinthewild.tal.club/" + qs, 30, quiet=True)
+        for art in h.split('<article class="post-frame')[1:]:
+            m = re.search(r'class="btn-apply" href="([^"]+)"', art)
+            if not m:
                 continue
-            post_url, _, after = rest.partition(")")
-            next_header = clean_lines(after)[:3]
-            cur_header, header = header, next_header
+            post_url = htmllib.unescape(m.group(1))
             if post_url in seen or not post_url.startswith("http"):
                 continue
             seen.add(post_url)
-            lines = clean_lines(body)
-            tags = ""
-            for i in range(len(lines) - 1, -1, -1):
-                if re.fullmatch(r"(?:[A-Za-z\-]+ ?){2,6}", lines[i]) and any(c.isdigit() for c in "".join(lines[i + 1:i + 3])):
-                    tags = lines[i]
-                    lines = lines[:i]
-                    break
-            text = re.sub(r"https?://\S+", "", " ".join(l.lstrip("# ") for l in lines))
-            text = re.sub(r"\s+", " ", text).strip()
-            name = cur_header[0][:80] if cur_header else ""
-            role = cur_header[1][:120] if len(cur_header) > 1 else ""
-            blob = (text + " " + tags).lower()
-            fam = tags.lower().split()[0] if tags else ""
+            g = lambda rx: (re.search(rx, art, re.S) or [None, ""])[1]
+            name = re.sub(r"\s+", " ", strip(g(r'<div class="name">(.*?)</div>')))[:80]
+            role = strip(g(r'<div class="headline">(.*?)</div>'))[:160]
+            when = strip(g(r'<div class="when">(.*?)</div>'))
+            title = strip(g(r'<span class="card-role">(.*?)</span>'))
+            org = strip(g(r'<span class="card-co">(.*?)</span>'))
+            body = htmllib.unescape(re.sub(r"<[^>]+>", "", g(r'<div class="body[^"]*">(.*?)</div>'))).strip()
+            tags = [strip(t) for t in re.findall(r'<span class="tag[^"]*">(.*?)</span>', art)]
+            fam = tags[0].lower() if tags else ""
+            tl = " ".join(tags).lower()
             if fam and fam not in ("engineering", "ai-ml"):
                 continue                                   # sales / marketing / ops posts etc.
-            if re.search(r"\b(senior|staff|lead|head|principal|intern)\b", tags.lower()) and not re.search(r"\b(junior|mid)\b", tags.lower()):
+            if re.search(r"\b(senior|staff|lead|head|principal|intern)\b", tl) and not re.search(r"\b(junior|mid)\b", tl):
                 continue
-            if not re.search(r"software|developer|full[\s-]?stack|front[\s-]?end|back[\s-]?end|react|node|typescript|javascript|\bsde\b|founding engineer|\bswe\b|ai engineer|web", blob):
+            blob = f"{title} {body} {tl}".lower()
+            if not re.search(r"software|developer|full[\s-]?stack|front[\s-]?end|back[\s-]?end|react|node|typescript|javascript|\bsde\b|founding engineer|\bswe\b|web", blob):
                 continue
             if is_staffing_text(blob, rules) or any(p in blob for p in rules.get("locations", {}).get("reject_region_phrases", [])):
                 continue
+            src = "LinkedIn" if "linkedin.com" in post_url else "X/Twitter" if ("x.com" in post_url or "twitter.com" in post_url) else "tal.club"
             out.append({
-                "source": "LinkedIn" if "linkedin.com" in post_url else "X/Twitter" if ("x.com" in post_url or "twitter.com" in post_url) else "tal.club",
-                "poster_name": name, "poster_role": role or "Founder / hiring team (tal.club)",
-                "poster_url": post_url, "post_url": post_url, "post_text": f"[{tags}] {text}"[:1800],
-                "skills_found": _extract_skills(blob, rules), "location": "India (Bangalore-focused)",
-                "posted_at": "",
+                "source": src, "poster_name": name, "poster_role": role or "Founder / hiring team (tal.club)",
+                "poster_url": post_url, "post_url": post_url, "post_text": body[:1800] or f"{title} @ {org}",
+                "skills_found": _extract_skills(blob, rules), "location": ", ".join(t for t in tags[2:4] if t[:1].isupper()) or "",
+                "posted_at": _ago_to_date(when), "_tr_org": org, "_headline": role or None,
             })
+        time.sleep(0.6)
     print(f"  → {len(out)} hiring posts")
     return out
 
@@ -2185,36 +2190,124 @@ def collect_hn_jobs(rules: dict) -> list[dict]:
 
 
 # ── Reddit via the free Arctic Shift archive (reddit.com itself blocks scripts) ─────
+_REDDIT_SUBS = ["developersIndia", "IndianDevelopers", "techjobs", "DeveloperJobs", "developerjobs", "softwareengineerjobs", "devjobs",
+                "WebDeveloperJobs", "hiring", "forhire", "remotejs", "RemoteJobs", "ProgrammingJobs", "StartUpIndia", "indianstartups",
+                "IndiaJobSearch", "gurgaon", "reactjs", "node", "startups", "jobbit"]
+_ARCTIC = "https://arctic-shift.photon-reddit.com/api/posts"
+
+
+def _arctic(url: str) -> list[dict] | None:
+    """arctic-shift sometimes answers with an error body instead of posts: retry, and return None (not []) when it never works."""
+    for attempt in range(3):
+        d = http_get(url, timeout=40, quiet=True)
+        if isinstance(d, dict) and isinstance(d.get("data"), list):
+            return d["data"]
+        time.sleep(2 + attempt * 3)
+    return None
+
+
+def _reddit_to_post(p: dict, sub: str, rules: dict, max_days: int) -> dict | None:
+    title, body = p.get("title", "") or "", p.get("selftext", "") or ""
+    low = (title + " " + body).lower()
+    tl = title.lower()
+    if sub.lower() in ("forhire", "hiring", "slavelabour") and "hiring" not in tl:
+        return None
+    if re.search(r"\[for hire\]|\[for-hire\]|\[task\]|\bfor hire\b|\[(?:discussion|question|meta|advice|help|rant|news)\]", tl) \
+            or "looking for work" in low or tl.rstrip().endswith("?"):
+        return None
+    if not re.search(r"\bhiring\b|\[hiring\]|looking for (?:a|an|\d+)\b|\bneed (?:a|an)\b|seeking (?:a|an)\b|\bopening|\bvacanc|position\b|join (?:our|us)", tl):
+        return None                                    # the title must announce an opening, not discuss the job market
+    created = p.get("created_utc") or 0
+    if created and (time.time() - float(created)) / 86400 > max_days:
+        return None
+    if not _HIRING_RE.search(low) or not (stack_hits(low, rules) or re.search(r"developer|engineer", low)):
+        return None
+    author = p.get("author", "")
+    if not author or author in ("[deleted]", "AutoModerator"):
+        return None
+    return {"source": f"Reddit r/{p.get('subreddit') or sub}", "poster_name": author, "poster_role": "Poster (Reddit)",
+            "poster_url": f"https://reddit.com/user/{author}",
+            "post_url": "https://reddit.com" + (p.get("permalink") or f"/comments/{p.get('id', '')}"),
+            "post_text": (title + "\n\n" + body)[:1800], "skills_found": _extract_skills(low, rules), "location": "",
+            "posted_at": datetime.fromtimestamp(float(created), timezone.utc).strftime("%Y-%m-%d") if created else ""}
+
+
 def collect_reddit_posts(rules: dict) -> list[dict]:
-    subs = ["forhire", "remotejs", "developersIndia", "IndiaJobSearch", "hiring", "ProgrammingJobs",
-            "startups", "reactjs", "node", "DeveloperJobs", "indianstartups", "StartUpIndia", "jobbit"]
+    """Hiring posts on Reddit via arctic-shift (Reddit itself blocks logged-out and datacenter access). Pages back up to
+    REDDIT_PAGES × 100 posts per sub so a missed run doesn't lose posts on busy subs like r/developersIndia."""
     out: list[dict] = []
-    max_days = rules.get("freshness", {}).get("max_age_days", 40)
-    for sub in subs:
-        d = http_get(f"https://arctic-shift.photon-reddit.com/api/posts/search?subreddit={sub}&limit=100&sort=desc", timeout=40)
-        items = d.get("data", []) if isinstance(d, dict) else []
-        n0 = len(out)
-        for p in items:
-            title, body = p.get("title", ""), p.get("selftext", "") or ""
-            low = (title + " " + body).lower()
-            if sub == "forhire" and "[hiring]" not in title.lower():
-                continue
-            if "[for hire]" in title.lower() or "looking for work" in low or "[task]" in title.lower():
-                continue
-            created = p.get("created_utc") or 0
-            if created and (time.time() - created) / 86400 > max_days:
-                continue
-            if not _HIRING_RE.search(low) or not (stack_hits(low, rules) or re.search(r"developer|engineer", low)):
-                continue
-            author = p.get("author", "")
-            out.append({"source": f"Reddit r/{sub}", "poster_name": author, "poster_role": "Poster (Reddit)",
-                        "poster_url": f"https://reddit.com/user/{author}",
-                        "post_url": "https://reddit.com" + p.get("permalink", ""),
-                        "post_text": (title + "\n\n" + body)[:1800], "skills_found": _extract_skills(low, rules),
-                        "location": "", "posted_at": datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%d") if created else ""})
-        print(f"[reddit] r/{sub}: {len(out) - n0} candidate posts")
+    seen: set[str] = set()
+    max_days = POST_MAX_DAYS
+    pages = int(os.environ.get("REDDIT_PAGES", "3" if SCAN_MODE == "full" else "1"))
+    for sub in _REDDIT_SUBS:
+        n0, before, failed = len(out), "", False
+        for _pg in range(pages):
+            items = _arctic(f"{_ARCTIC}/search?subreddit={sub}&limit=100&sort=desc" + (f"&before={before}" if before else ""))
+            if items is None:
+                failed = True
+                break
+            for p in items:
+                post = _reddit_to_post(p, sub, rules, max_days)
+                if post and post["post_url"] not in seen:
+                    seen.add(post["post_url"])
+                    out.append(post)
+            if len(items) < 100:
+                break
+            oldest = min(float(p.get("created_utc") or 0) for p in items)
+            if not oldest or (time.time() - oldest) / 86400 > max_days:
+                break
+            before = str(int(oldest))
+            time.sleep(0.4)
+        print(f"[reddit] r/{sub}: {len(out) - n0} candidate posts" + (" (arctic-shift unavailable)" if failed else ""))
         time.sleep(0.4)
     return out
+
+
+def collect_onlyhiring(rules: dict) -> list[dict]:
+    """onlyhiring (a free public feed of AI-checked Reddit [Hiring] posts, incl. subs we don't poll): it gives the post ids;
+    the full text and author come from arctic-shift, so every post goes through the same Reddit vetting."""
+    d = http_get("https://onlyhiring.hassanaziz0012.workers.dev/api/jobs", timeout=40, quiet=True)
+    rows = d.get("jobs", []) if isinstance(d, dict) else []
+    keep = []
+    for r in rows:
+        if str(r.get("expired")).lower() == "true" or not r.get("redditUrl"):
+            continue
+        if r.get("role") not in (None, "", "web_development", "software_engineering", "software_development", "full_stack", "frontend", "backend") \
+                and not re.search(r"react|node|next|typescript|javascript|full[\s-]?stack|front[\s-]?end|back[\s-]?end", str(r.get("title", "")), re.I):
+            continue
+        if (days_ago(str(r.get("postedAt", ""))[:10]) or 0) > POST_MAX_DAYS:
+            continue
+        blob = " ".join(str(r.get(k, "")) for k in ("title", "summary", "skills")).lower()
+        if not re.search(r"react|node|next\.?js|typescript|javascript|mern|full[\s-]?stack|front[\s-]?end", blob):
+            continue
+        m = re.search(r"/comments/([a-z0-9]+)", r["redditUrl"])
+        if m:
+            keep.append(m.group(1))
+    out = []
+    for i in range(0, len(keep), 50):
+        items = _arctic(f"{_ARCTIC}/ids?ids={','.join(keep[i:i + 50])}") or []
+        for p in items:
+            post = _reddit_to_post(p, p.get("subreddit", ""), rules, POST_MAX_DAYS)
+            if post:
+                post["source"] = f"Reddit r/{p.get('subreddit', '')}"
+                out.append(post)
+        time.sleep(0.5)
+    print(f"[onlyhiring] {len(rows)} listed → {len(keep)} JS-stack ids → {len(out)} candidate posts")
+    return out
+
+
+_REDDIT_FEED: dict[str, bool] = {}
+
+
+def reddit_author_is_feed(author: str) -> bool:
+    """Rule 8b for Reddit: an account whose recent posts are mostly job ads is a job feed / reposter, not a hirer."""
+    if author in _REDDIT_FEED:
+        return _REDDIT_FEED[author]
+    items = _arctic(f"{_ARCTIC}/search?author={urllib.parse.quote(author)}&limit=25&sort=desc") or []
+    ads = sum(1 for p in items if re.search(r"\bhiring\b|\[hiring\]|job opening|we(?:'re| are) looking for|vacanc", (p.get("title") or "").lower()))
+    feed = len(items) >= 5 and ads / len(items) >= 0.6 and len({(p.get("title") or "")[:30] for p in items}) >= 4
+    _REDDIT_FEED[author] = feed
+    return feed
 
 
 # ── LinkedIn Jobs (public guest endpoint, no login) ─────────────────────────────
@@ -2331,15 +2424,24 @@ _HIRING_RE = re.compile(r"\b(we(?:'re| are)\s+(?:hiring|looking|expanding)|is hi
 _FEED_HEADLINE = re.compile(r"hiring solutions|client coordinator|consulting|helping people find|dream jobs?|job (?:alerts?|updates?|portal|board|feed|vacanc)|jobs? (?:and|&) (?:career|internship)|daily jobs?|"
                             r"placement|staffing|consultanc|manpower|recruitment (?:agency|services|firm)|opportunit(?:y|ies) (?:hub|for)|"
                             r"career guidance|freelance(?:r| platform)|hiring updates|off[- ]campus|referral (?:group|community)", re.I)
+def _feed_or_agency(who: str, rules: dict) -> bool:
+    """Job-feed / staffing author? IT-services majors (TCS, Infosys, Accenture…) are allowed: they hire for themselves (rule 8)."""
+    w = (who or "").lower()
+    if not w or any(a in w for a in rules.get("staffing_filter", {}).get("it_services_allowed", [])):
+        return False
+    return bool(_FEED_HEADLINE.search(w) or is_staffing_company(w, rules))
+
+
 _SEEKER_TEXT = re.compile(r"refer me|can anyone refer|my resume|available for hire|for hire\b|open to work|#opentowork|available immediately|looking for (?:my next|a new|new) (?:role|opportunit|position|job)|"
                           r"(?:actively )?(?:seeking|looking for) (?:a )?(?:new )?(?:role|opportunit|position|job)s? (?:as|in|for|where)|"
                           r"i(?:'m| am) (?:currently )?(?:looking|available|seeking)", re.I)
 _FEED_TEXT = re.compile(r"\bclient\s*:|\bw-?2\b|\b1099\b|#?job ?alert|like,? (?:share|comment)|tag (?:someone|a friend)|"
                         r"follow (?:me|us|the page) for|join (?:my|our) (?:whatsapp|telegram|community|group)|walk[- ]?in|"
-                        r"our client|client requirement|\bbench\b|\bc2c\b|corp[- ]to[- ]corp", re.I)
+                        r"our client|client requirement|\bbench\b|\bc2c\b|corp[- ]to[- ]corp|\bc2h\b|contract[- ]to[- ]hire", re.I)
 _POSTER_TITLE = re.compile(r"founder|co-?founder|\bceo\b|\bcto\b|\bcpo\b|\bcoo\b|chief|owner|president|"
                            r"head of|\bvp\b|director|recruit|talent|\bhr\b|human resources|people (?:ops|operations|partner|team|and culture)|"
-                           r"hiring manager|engineering manager|tech lead|\bengineer\b|\bdeveloper\b|\bsde\b|\bswe\b", re.I)
+                           r"hiring manager|engineering manager|tech lead|\bengineer\b|\bdeveloper\b|\bsde\b|\bswe\b|"
+                           r"\bengineering\b|\blead(?:er|ing)?\b|\bhead\b|\bmanager\b|\bpartner\b|\bstaff\b|\barchitect\b", re.I)
 _POST_NEG = ["designer", "ui/ux", "ux", "sales", "marketing", "devops", "data scientist", "ml engineer", "qa", "tester",
              "intern", "interns", "internship", "internships", "freelance", "freelancer", "contract", "contractor", "robotics",
              "embedded", "firmware", "ai engineer", "machine learning", "data engineer", "cloud engineer", "forward deployed",
@@ -2358,7 +2460,7 @@ _BAD_ROLE = re.compile(r"\b(?:manager|head of|team lead(?:er)?|tech lead|\blead\
                        r"qa\b|tester|analyst|executive|specialist)\b", re.I)
 _CONTACT_ROUTE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\bdm\b|direct message|message me|reach out|get in touch|contact (?:me|us)|"
                             r"send (?:your |an? )?(?:cv|resume|profile|portfolio|application)|share (?:your )?(?:cv|resume|profile)|"
-                            r"drop (?:your )?(?:cv|resume)|whatsapp|\bcomment\b|ping me|(?:call|text)\s*[:\-]?\s*\+?\d[\d ]{8,}|\+?\d[\d -]{9,}\d|"
+                            r"drop (?:your )?(?:cv|resume)|whatsapp|ping me|(?:call|text)\s*[:\-]?\s*\+?\d[\d ]{8,}|\+?\d[\d -]{9,}\d|"
                             r"apply (?:here|now|at|via|through|on)\b.{0,60}https?://|https?://\S*(?:apply|careers?|jobs?|forms?)\S*", re.I)
 POST_MAX_DAYS = int(os.environ.get("POST_MAX_DAYS", "30"))
 _ENTRY_TEXT = re.compile(r"\bfreshers?\b|\bfresh graduates?\b|\b0\s*(?:-|–|to)\s*(?:6\s*months?|1\s*(?:years?|yrs?)|2\s*(?:years?|yrs?))\b|"
@@ -2418,7 +2520,40 @@ _ONSITE = re.compile(r"face[- ]to[- ]face|walk[- ]in|local (?:candidates|applica
 _REMOTE_OK = re.compile(r"\bremote\b|work from home|\bwfh\b|hybrid|anywhere", re.I)
 _NOT_INDIA = re.compile(r"\b(?:egypt|saudi|riyadh|jeddah|uae|dubai|abu dhabi|qatar|kuwait|bahrain|oman|nigeria|philippines|pakistan|bangladesh|"
                         r"sri lanka|poland|brazil|mexico|turkey|israel|germany|france|netherlands|singapore|malaysia|australia)\b|#egypt", re.I)
-_GIG = re.compile(r"trial|contract basis|stipend|part[- ]time|unpaid|per hour|\bfreelance|internship|\bintern\b|project[- ]based|commission", re.I)
+_GIG = re.compile(r"\btrial (?:period|task|basis|project)|\bpaid trial|contract basis|stipend|part[- ]time|unpaid|per hour|\bfreelance|internship|\bintern\b|"
+                  r"project[- ]based|commission[- ]based|\bon commission\b|commission only", re.I)
+# The author is the one hiring ("we're hiring", "my team is hiring", "I'm looking for a React developer to join…",
+# "DM me for a referral"). Used to keep these apart from job SEEKERS, whose posts also say "I'm looking…" / "I am a developer".
+_HIRER_VOICE = re.compile(r"\bwe(?:'re| are)\s+(?:hiring|looking for|growing|expanding|building)|\bmy team (?:is|are) (?:hiring|growing|looking)|"
+                          r"\bour team (?:is|are) (?:hiring|growing|looking)|\bi(?:'m| am) hiring|\blooking to hire\b|"
+                          r"\b(?:i'm|i am|we're|we are) looking for (?:a|an|talented|experienced|skilled|strong|passionate|motivated|\d+)\b[^.\n]{0,50}"
+                          r"\b(?:developers?|engineers?|sdes?)\b[^.\n]{0,40}\b(?:to join|for (?:my|our)|at\b|in (?:my|our))|"
+                          r"\b(?:dm|message|ping) me for (?:a |the )?referral|\bhappy to refer\b|\bi can refer\b|\bwe have (?:an? )?openings?\b", re.I)
+_HARD_SEEKER = re.compile(r"open to work|#opentowork|refer me\b|can anyone refer|hire me\b|my resume\b|available for hire|"
+                          r"looking for (?:my next|a new|new) (?:role|opportunit|position|job)|laid off|seeking (?:a )?(?:new )?(?:job|role|opportunit)", re.I)
+_FRESHER_WELCOME = re.compile(r"[,;(]?\s*(?:\(?\s*)?(?:even |also )?freshers?(?: with [^.,;)\n]{0,40})?\s+(?:are |can |may )?(?:also |too )?"
+                              r"(?:welcome|apply|encouraged|considered)\w*\s*\)?", re.I)
+
+
+def _soften_fresher_welcome(text: str) -> str:
+    """'1-3 years, freshers with strong projects also welcome' is a genuine 1-3 yr role (CLAUDE.md rule 4): drop the welcome phrase
+    so the entry-level checks don't fire, but only when the post states a real 1-3 yr minimum."""
+    if not _FRESHER_WELCOME.search(text):
+        return text
+    mins = [lo for lo, _hi in _exp_ranges(text) if lo is not None]
+    return _FRESHER_WELCOME.sub(" ", text) if mins and 1 <= min(mins) <= 3 else text
+
+
+_ROLE_AFTER = re.compile(r"(?:hiring|looking for|seeking|role|position|opening|vacancy|title)\s*[:\-–|]?\s*(?:an?\s+|for\s+(?:an?\s+)?)?([^\n.,!?(|:;]{3,70})", re.I)
+
+
+def _role_text(low: str) -> str:
+    """The role being hired, not the company blurb: phrases after 'hiring / role: / position:' plus the first line."""
+    first = low.strip().split("\n", 1)[0][:160]
+    if first.count("|") >= 2:                          # HN / sheet style "Company | Role | Location | …": the role is the 2nd field
+        return " | ".join(first.split("|")[1:3])
+    roles = [m.group(1) for m in _ROLE_AFTER.finditer(low[:700])]
+    return " | ".join(roles) if roles else first
 _FIRST_PERSON_SEEKER = re.compile(r"\babout me\b|\bi had been\b|\bi was laid off\b|laid off|\bmy (?:experience|skills|resume|cv|portfolio|projects)\b|"
                                   r"\bi(?:'m| am) (?:really |highly |currently |also )*(?:looking|urgently|proficient|seeking|available|a )|"
                                   r"urgently looking for a job|\bany suggestions\b|exhausted|\bi have (?:built|worked|been)\b|\bhire me\b", re.I)
@@ -2429,9 +2564,12 @@ _STRONG_HIRING = re.compile(r"\bwe(?:'re| are)\s+(?:hiring|looking|expanding|see
 def _post_full_text_checks(text: str, low: str, p: dict, rules: dict):
     """Reads the WHOLE post, not just the title. Returns a rejection reason or ''."""
     first = low[:200]
-    if re.match(r"\s*(?:looking for|seeking|need|want)\b[^\n]{0,60}(?:role|job|position|opportunit)", first) or _FIRST_PERSON_SEEKER.search(low):
+    hirer = bool(_HIRER_VOICE.search(low))
+    if _HARD_SEEKER.search(low) or (not hirer and (re.match(r"\s*(?:looking for|seeking|need|want)\b[^\n]{0,60}(?:role|job|position|opportunit)", first)
+                                                    or _FIRST_PERSON_SEEKER.search(low))):
         return "job-seeker post (the author is looking for a job)"
-    if not _STRONG_HIRING.search(low):
+    structured = str(p.get("source", "")).startswith(("Hiring sheet", "HN"))
+    if not structured and not hirer and not _STRONG_HIRING.search(low):
         return "no clear 'we are hiring' statement"
     lpa = post_salary_lpa(text)
     if lpa is not None and lpa < rules.get("compensation", {}).get("india_min_lpa", 15):
@@ -2465,7 +2603,28 @@ def _post_age_days(p: dict):
 _TEMPLATE_POST = re.compile(r"apply today or share this post|share this post with your network|click (?:on )?the link below to apply$", re.I)
 
 
+_THIRD_PERSON_SHARE = re.compile(r"^\W*(?:[\w&.'\- ]{2,40}\s+)?(?:is|are)\s+(?:now\s+)?hiring\b|ready to take your career|"
+                                 r"(?:latest|top|daily)\s+(?:job|hiring)\s+(?:openings|updates|alerts)|apply (?:fast|asap) before", re.I)
+_ENGAGEMENT_BAIT = re.compile(r"comment\s*[\"'“]?\s*(?:interested|yes|me|cv|resume)|follow (?:me |us |the page |our page )?for (?:more|daily|regular)|"
+                              r"drop (?:your )?(?:email|mail id|e-mail)|like (?:and|&) share|repost (?:to|for) (?:help|reach)", re.I)
+
+
 def vet_post(p: dict, rules: dict) -> tuple[bool, str]:
+    soft = _soften_fresher_welcome(p.get("post_text") or "")
+    if soft != (p.get("post_text") or ""):
+        p = {**p, "post_text": soft}
+    low = unicodedata.normalize("NFKC", p.get("post_text") or "").replace("’", "'").lower()
+    if _ENGAGEMENT_BAIT.search(low):
+        return False, "engagement-bait post (comment / follow for more)"
+    src, role = str(p.get("source", "")), (p.get("poster_role") or "")
+    if src in ("LinkedIn", "X/Twitter") and role != "Company page":
+        own = re.search(r"\b(?:we|we're|our|us|my team|i'm hiring|i am hiring|i'm looking|i am looking|dm me|message me|ping me|refer)\b", low[:700])
+        if _THIRD_PERSON_SHARE.search(low[:300]) and not re.search(r"\b(?:we|we're|our|my team)\b", low[:700]):
+            return False, "someone else's job shared in the third person (job-feed style)"
+        if not role and not own:
+            return False, "author unverifiable and the post isn't written by the hirer"
+        if (p.get("_followers") or 0) >= 15000 and not re.search(r"\b(?:we|we're|our|my team)\b", low[:500]):
+            return False, "large audience account sharing a job (job-feed style)"
     ok, why = _vet_post_base(p, rules)
     if not ok:
         return ok, why
@@ -2491,8 +2650,14 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     why = _post_full_text_checks(text, low, p, rules)
     if why:
         return False, why
-    if re.search(r"teamware|\bstaffing\b|\bconsultancy\b|manpower|talent solutions|hr solutions|recruitment", (p.get("_tr_org") or "") + " " + (p.get("poster_role") or ""), re.I):
+    _org_role = (p.get("_tr_org") or "") + " " + (p.get("poster_role") or "")
+    if re.search(r"teamware|\bstaffing\b|\bconsultancy\b|manpower|talent solutions|hr solutions|recruitment", _org_role, re.I) \
+            and not any(a in _org_role.lower() for a in rules.get("staffing_filter", {}).get("it_services_allowed", [])):
         return False, "staffing / recruitment agency"
+    domains = [m.group(0).split("@")[1].split(".")[0] for m in _MAIL_ANY.finditer(low)]
+    for who in (p.get("_tr_org"), p.get("poster_name"), p.get("poster_role"), *domains):
+        if who and _feed_or_agency(who, rules):
+            return False, "staffing / job-feed account"
     if _TEMPLATE_POST.search(low) or re.search(r"^\s*we're #hiring a new [^\n]{3,120}\.\s*apply", low):
         return False, "auto-generated company-page job card"
     if re.search(r"welcom(?:e|ing)\b.{0,40}\b(?:to the team|to \w+ as)|joined (?:us|our team) as|\bnew (?:joiner|hire)s?\b|work anniversary|birthday", head):
@@ -2500,6 +2665,7 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     if not _DEV_ROLE.search(head):
         return False, "no developer role named"
     heading = re.split(r"\n\s*\n", text.strip(), 1)[0][:300].lower()
+    heading = re.sub(r"hiring manager(?: here)?|talent acquisition manager|hr manager|engineering manager here", " ", heading)
     if re.search(r"\b(?:sde|swe|software (?:development )?engineer|engineer|developer)\s*[-–]?\s*(?:3|iii|4|iv|5)\b|\bl[4-6]\b|\bsde[\s-]?(?:3|iii)\b", heading):
         return False, "senior-level (level III+)"
     if _BAD_ROLE.search(heading):
@@ -2529,7 +2695,7 @@ def _vet_post_strict(p: dict, rules: dict) -> tuple[bool, str]:
     if src.startswith("HN") and (re.match(r"\s*i'?m [^,\n]{2,40},", low) or "seeking work" in low or "wants to be hired" in low):
         return False, "job-seeker post"
     if src.startswith(("HN", "Hiring sheet")):
-        if re.search(r"\b(?:us|usa|canada|europe|eu|uk|latam|emea)\b", low[:220]) and not re.search(r"india|asia|apac|anywhere|global", low[:400]):
+        if re.search(r"\b(?:us|usa|canada|europe|eu|eea|uk|latam|emea)\b", low[:220]) and not re.search(r"india|asia|apac|anywhere|global", low[:400]):
             return False, "remote limited to US / Europe"
         if not re.search(r"india|worldwide|anywhere|global|apac|asia|remote\s*\(?(?:global|any)", low[:500]) and \
                 (re.search(r",\s*[A-Z]{2}\b", text[:300]) or re.search(r"hybrid|on-?site|in[- ]office", head)):
@@ -2549,14 +2715,19 @@ def _vet_post_base(p: dict, rules: dict) -> tuple[bool, str]:
         return False, "not a hiring post"
     if is_staffing_text(low, rules) or _FEED_TEXT.search(low):
         return False, "staffing / reshare / job-feed style post"
-    if _SEEKER_TEXT.search(low) or re.match(r"\s*(?:looking for|seeking)\b[^\n]{0,70}(?:opportunit|roles?\b|positions?\b)", low) or "open to relocate" in low:
+    hirer = bool(_HIRER_VOICE.search(low))
+    if _HARD_SEEKER.search(low) or "open to relocate" in low:
         return False, "job-seeker post, not a hiring post"
-    if re.search(r"\bi(?:'m| am) a (?:\w+ ){0,4}(?:developer|engineer|designer)\b", low[:300]):
+    if not hirer and (_SEEKER_TEXT.search(low) or re.match(r"\s*(?:looking for|seeking)\b[^\n]{0,70}(?:opportunit|roles?\b|positions?\b)", low)
+                      or re.search(r"\bi(?:'m| am) a (?:\w+ ){0,4}(?:developer|engineer|designer)\b", low[:300])):
         return False, "job-seeker post, not a hiring post"
     hdr = low[:300].split("\n")[0] if "\n" in low[:300] else low[:300]
-    if re.search(r"remote\s*\(?\s*(?:us|usa|u\.s\.|canada|eu|europe|uk|emea|north america)\b|\(us\b|us citizens?|\bus[- ]?only\b", hdr) \
+    if re.search(r"remote\s*\(?\s*(?:us|usa|u\.s\.|canada|eu|eea|europe|uk|emea|north america)\b|\(us\b|us citizens?|\bus[- ]?only\b", hdr) \
             and not re.search(r"india|worldwide|anywhere|global|apac", hdr):
         return False, "US/EU-only remote"
+    if re.search(r"\bonshore\b|\beast coast\b|\bwest coast\b|\b(?:est|pst|cst|et|pt) (?:hours|time ?zone)|us time ?zones?|green card|\bgc holders?\b", low) \
+            and not re.search(r"india|worldwide|anywhere|apac", low[:600]):
+        return False, "US-based role (onshore / US hours)"
     if _NOT_HIRING.search(low[:1200]):
         return False, "announcement / marketing / agency post, not a hiring post"
     if "[removed]" in low or "[deleted]" in low:
@@ -2566,7 +2737,7 @@ def _vet_post_base(p: dict, rules: dict) -> tuple[bool, str]:
     if not (_HIRING_RE.search(low[:400]) or structured):
         return False, "not clearly a hiring announcement"
     role = (p.get("poster_role") or "")
-    if _FEED_HEADLINE.search(role):
+    if _feed_or_agency(role, rules):
         return False, "poster looks like a job-feed / agency account"
     for excl in rules.get("excluded_companies", []):
         if _has(excl.lower(), low[:400]):
@@ -2582,8 +2753,11 @@ def _vet_post_base(p: dict, rules: dict) -> tuple[bool, str]:
                         r"\bsde\b|\bsoftware development\b|\bfounding engineer|\bfull[\s-]?stack\b", head)
     if not core and not generic:
         return False, "not a matching software-dev role"
+    role_txt = _role_text(low)
     for bad in _POST_NEG:
-        if bad != "recruiter" and _has(bad, head):
+        if bad != "recruiter" and _has(bad, role_txt):
+            if bad == "react native" and re.search(r"react native[^.\n;)]{0,25}(?:plus|nice|good to have|bonus|advantage)", low):
+                continue
             return False, f"different discipline ({bad})"
     for ph in rules.get("experience", {}).get("fresher_phrases", []):
         if ph.lower() in low[:1500] and not re.search(r"\b[1-3]\s*(?:-|to|\+)\s*[3-6]?\s*(?:years|yrs)", low):
@@ -2742,6 +2916,7 @@ def _search_post_urls(query: str) -> list[str]:
 
 
 _PROFILE_HEAD: dict[str, str] = {}
+_PROFILE_FAILS = [0]
 
 
 def _li_headline(profile_url: str) -> str | None:
@@ -2750,8 +2925,11 @@ def _li_headline(profile_url: str) -> str | None:
         return None
     if profile_url in _PROFILE_HEAD:
         return _PROFILE_HEAD[profile_url]
+    if _PROFILE_FAILS[0] >= 6:                     # LinkedIn answers 999 (login wall) to this IP: stop wasting a request per post
+        return None
     time.sleep(1.0)
     h = http_get_text(profile_url, 20, quiet=True)
+    _PROFILE_FAILS[0] = 0 if h else _PROFILE_FAILS[0] + 1
     m = re.search(r'<meta property="og:title" content="([^"]+)"', h or "")
     head = None
     if m:
@@ -2781,9 +2959,12 @@ def _li_public_post(url: str, rules: dict) -> dict | None:
                 return None
             purl = (a.get("url") or "").split("?")[0]
             head = _li_headline(purl)
+            stats = a.get("interactionStatistic") or []
+            stats = stats if isinstance(stats, list) else [stats]
+            followers = max([int(x.get("userInteractionCount") or 0) for x in stats if isinstance(x, dict)] or [0])
             return {"source": "LinkedIn", "poster_name": unicodedata.normalize("NFKC", a.get("name", "")), "poster_role": head or "",
                     "poster_url": purl or url, "post_url": url, "post_text": body[:1800], "skills_found": _extract_skills(body, rules),
-                    "location": "", "posted_at": date, "_headline": head}
+                    "location": "", "posted_at": date, "_headline": head, "_followers": followers}
     return None
 
 
@@ -2812,6 +2993,162 @@ def collect_linkedin_search(rules: dict) -> list[dict]:
         if p:
             out.append(p)
     print(f"  → {len(out)} readable posts")
+    return out
+
+
+# ── LinkedIn hiring posts via Google News RSS (free, keyless, no login) ─────────────────────────────
+# news.google.com indexes public LinkedIn posts; `site:linkedin.com/posts … when:1d` returns up to 100 of them per query with the
+# real publish date. Each item link is a Google id → one GET + one batched POST turns it into the linkedin.com/posts URL, and
+# the public post page then gives the full text and author (same reader as the Serper route).
+GN_TERMS = [
+    'hiring react', 'hiring ("next.js" OR nextjs)', 'hiring ("node.js" OR nodejs)', 'hiring typescript', 'hiring "javascript developer"',
+    'hiring MERN', 'hiring "full stack developer"', 'hiring "frontend developer"', 'hiring "frontend engineer"', 'hiring "software engineer" react',
+    '"we are hiring" "react"', '"we\'re hiring" developer node', '"looking for" "react developer"', '"immediate joiner" react',
+    '"founding engineer" hiring', 'hiring "backend developer" node', '"my team is hiring" engineer', 'referral hiring react developer',
+    'hiring "SDE" react OR node', 'hiring "react js" bangalore OR hyderabad OR pune OR chennai', 'hiring "full stack" remote india',
+    'hiring "full stack engineer"', '"send your resume" react', '"DM me" hiring developer react',
+]
+_GN_EDITIONS = (("en-IN", "IN", "IN:en"), ("en-US", "US", "US:en"))
+_GN_429 = [False]
+
+
+def _gn_rss(query: str, edition=("en-IN", "IN", "IN:en")) -> list[dict]:
+    hl, gl, ceid = edition
+    u = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    x = http_get_text(u, 30, quiet=True)
+    out = []
+    for it in re.findall(r"<item>(.*?)</item>", x or "", re.S):
+        t, g, d = (re.search(r"<title>(.*?)</title>", it, re.S), re.search(r"<guid[^>]*>(.*?)</guid>", it), re.search(r"<pubDate>(.*?)</pubDate>", it))
+        if not (t and g):
+            continue
+        try:
+            date = email.utils.parsedate_to_datetime(d.group(1)).strftime("%Y-%m-%d") if d else ""
+        except (TypeError, ValueError):
+            date = ""
+        out.append({"title": htmllib.unescape(t.group(1)).replace(" - LinkedIn", "").strip(), "gid": g.group(1).strip(), "date": date})
+    return out
+
+
+def _gn_title_ok(title: str, rules: dict) -> bool:
+    """Cheap pre-filter on the ~250-char post start, so only likely matches are decoded and read."""
+    t = unicodedata.normalize("NFKC", title).lower()
+    if not _DEV_ROLE.search(t) or _HARD_SEEKER.search(t):
+        return False
+    if not (_HIRING_RE.search(t) or re.search(r"\bhiring\b|#hiring|opening|join", t)):
+        return False
+    if _NOT_INDIA.search(t) and not re.search(r"india|remote|bangalore|bengaluru|hyderabad|pune|mumbai|delhi|noida|gurgaon|gurugram|chennai", t):
+        return False
+    core = re.search(r"react|node|next\.?js|typescript|javascript|mern|full[\s-]?stack|front[\s-]?end|back[\s-]?end|software|web|sde|founding", t)
+    if not core or (_BLOCK_WORDS.search(t) and not re.search(r"react|node|next\.?js|typescript|javascript|mern", t)):
+        return False
+    mins = [lo for lo, _hi in _exp_ranges(title) if lo is not None]
+    if mins and min(mins) > rules.get("experience", {}).get("max_min_years", 3):
+        return False
+    if re.search(r"\b(?:senior|sr\.?|lead|principal|staff|architect|director|head of|vp)\b", t) and not re.search(r"junior|\b[1-3]\s*(?:-|–|to|\+)", t):
+        return False
+    return True
+
+
+def _gn_decode(gids: list[str]) -> dict[str, str]:
+    """Google News item id → original URL (the page carries a signature + timestamp that the batchexecute RPC needs)."""
+    out: dict[str, str] = {}
+    gap = float(os.environ.get("GN_DECODE_GAP", "1.6"))
+    pending: list[tuple[str, list]] = []
+
+    def flush():
+        if not pending:
+            return
+        body = "f.req=" + urllib.parse.quote(json.dumps([[req for _g, req in pending]]))
+        req = urllib.request.Request("https://news.google.com/_/DotsSplashUi/data/batchexecute", data=body.encode(), method="POST",
+                                     headers={"User-Agent": BROWSER_UA, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                txt = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _GN_429[0] = True
+            txt = ""
+        except Exception:
+            txt = ""
+        urls = [u.encode().decode("unicode_escape") for u in re.findall(r'\[\\"garturlres\\",\\"(.*?)\\"', txt)]
+        if len(urls) == len(pending):
+            for (g, _req), u in zip(pending, urls):
+                out[g] = u
+        pending.clear()
+
+    for g in gids:
+        if _GN_429[0]:
+            break
+        try:
+            req = urllib.request.Request(f"https://news.google.com/rss/articles/{g}", headers={"User-Agent": BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                h = r.read(3_000_000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _GN_429[0] = True
+                print("  [google-news] rate-limited (429) — the rest waits for the next run")
+            continue
+        except Exception:
+            continue
+        sg, ts = re.search(r'data-n-a-sg="([^"]+)"', h), re.search(r'data-n-a-ts="([^"]+)"', h)
+        if sg and ts:
+            inner = json.dumps(["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+                                               "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], g, int(ts.group(1)), sg.group(1)])
+            pending.append((g, ["Fbv4je", inner, None, "generic"]))
+        if len(pending) >= 10:
+            flush()
+        time.sleep(gap)
+    flush()
+    return out
+
+
+def collect_linkedin_gnews(rules: dict) -> list[dict]:
+    """LinkedIn hiring posts found through Google News RSS. Light scans: a rotating slice of the terms, last 24 h.
+    Full scans: every term, both editions, last 3 days. Items already looked at are never fetched again (gn_seen)."""
+    full = SCAN_MODE == "full"
+    n = len(GN_TERMS) if full else int(os.environ.get("GN_TERMS_LIGHT", "8"))
+    turn = int(_kv_get("gn_turn") or 0)
+    terms = GN_TERMS if full else [GN_TERMS[(turn * n + i) % len(GN_TERMS)] for i in range(n)]
+    _kv_set("gn_turn", str(turn + 1))
+    window = os.environ.get("GN_WINDOW", "3d" if full else "1d")
+    editions = _GN_EDITIONS if full else (_GN_EDITIONS[turn % 2],)
+    conn = get_db()
+    seen_g = {r[0] for r in conn.execute("SELECT gid FROM gn_seen")}
+    known = {r[0] for r in conn.execute("SELECT post_url FROM posts")}
+    conn.close()
+    items: dict[str, dict] = {}
+    raw = 0
+    for ed in editions:
+        for q in terms:
+            got = _gn_rss(f"site:linkedin.com/posts {q} when:{window}", ed)
+            raw += len(got)
+            for it in got:
+                if it["gid"] not in seen_g:
+                    items.setdefault(it["gid"], it)
+            time.sleep(1.0)
+    fresh = [it for it in items.values() if (days_ago(it["date"]) or 0) <= POST_MAX_DAYS]
+    good = [it for it in fresh if _gn_title_ok(it["title"], rules)]
+    cap = int(os.environ.get("GN_DECODE_MAX", "60" if full else "40"))   # Google answers 429 after ~65 decodes in a row
+    todo = sorted(good, key=lambda it: it["date"], reverse=True)[:cap]
+    urls = _gn_decode([it["gid"] for it in todo]) if todo else {}
+    stamp = now_utc()
+    conn = get_db()
+    done = {it["gid"] for it in items.values() if it not in good} | set(urls)      # title-rejected items are settled too
+    conn.executemany("INSERT OR IGNORE INTO gn_seen (gid, url, at) VALUES (?,?,?)", [(g, urls.get(g, ""), stamp) for g in done])
+    conn.commit()
+    conn.close()
+    out = []
+    for it in todo:
+        u = (urls.get(it["gid"]) or "").split("?")[0]
+        if not re.search(r"linkedin\.com/(?:posts|feed/update)/", u) or u in known:
+            continue
+        p = _li_public_post(u, rules)
+        if p:
+            p["posted_at"] = p.get("posted_at") or it["date"]
+            out.append(p)
+    print(f"[google-news] {len(terms)} terms × {len(editions)} edition(s), when:{window} → {raw} items, {len(items)} new, "
+          f"{len(good)} pass the title check → {len(urls)} decoded → {len(out)} readable LinkedIn posts"
+          + (" (stopped early: rate-limited)" if _GN_429[0] else ""))
     return out
 
 
@@ -4486,6 +4823,24 @@ def enforce_company_cap(conn: sqlite3.Connection, cap: int = MAX_ROLES_PER_COMPA
     return removed
 
 
+AUTHOR_FEED_POSTS = int(os.environ.get("AUTHOR_FEED_POSTS", "4"))
+
+
+def _author_key(post: dict) -> str:
+    """One id per human: LinkedIn profile slug (from the profile or post URL), Reddit / X handle."""
+    src = str(post.get("source", ""))
+    for u in (post.get("poster_url") or "", post.get("post_url") or ""):
+        m = re.search(r"linkedin\.com/in/([^/?#]+)", u) or re.search(r"linkedin\.com/posts/([^/?#_]+)_", u)
+        if m:
+            return "li:" + urllib.parse.unquote(m.group(1)).lower()
+        m = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{2,15})/status", u)
+        if m:
+            return "x:" + m.group(1).lower()
+    if src.startswith("Reddit") and post.get("poster_name"):
+        return "reddit:" + post["poster_name"].lower()
+    return ""
+
+
 def ingest_posts(conn: sqlite3.Connection, rules: dict, fns, per_source: dict | None = None) -> tuple[int, dict]:
     """Collect hiring posts, vet each one (genuine hirer, stack, experience, location) and store the survivors."""
     per_source = per_source if per_source is not None else {}
@@ -4504,20 +4859,33 @@ def ingest_posts(conn: sqlite3.Connection, rules: dict, fns, per_source: dict | 
                     ok_post, why = False, "author is a job-seeker"
                 if ok_post and head is not None and not _POSTER_TITLE.search(head):
                     ok_post, why = False, "author is not a founder / recruiter / engineer"
-                if ok_post and head is not None and (_FEED_HEADLINE.search(head) or is_staffing_company(head, rules)):
+                if ok_post and head is not None and _feed_or_agency(head, rules):
                     ok_post, why = False, "job-feed / agency author"
                 akey = post.get("poster_name", "") or post.get("poster_url", "")
                 if ok_post and akey and conn.execute("SELECT COUNT(*) FROM posts WHERE poster_name=? AND source=?",
                                                      (akey, post.get("source", ""))).fetchone()[0] >= 3:
                     ok_post, why = False, "author already has 3 posts"
+                # rule 8b — hiring, not sharing: judge the author by their posting history, not one post
+                hk = _author_key(post)
+                if hk and post.get("post_url") and _HIRING_RE.search((post.get("post_text") or "").lower()):
+                    conn.execute("INSERT OR IGNORE INTO author_posts (akey, post_url, hiring, at) VALUES (?,?,1,?)",
+                                 (hk, post["post_url"], now_utc()))
+                    conn.commit()
+                if ok_post and hk:
+                    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+                    n_hiring = conn.execute("SELECT COUNT(*) FROM author_posts WHERE akey=? AND hiring=1 AND at>=?", (hk, since)).fetchone()[0]
+                    if n_hiring >= AUTHOR_FEED_POSTS:
+                        ok_post, why = False, f"job-feed account ({n_hiring} different hiring posts in 30 days)"
+                if ok_post and str(post.get("source", "")).startswith("Reddit") and reddit_author_is_feed(post.get("poster_name", "")):
+                    ok_post, why = False, "job-feed account (most of the author's recent posts are job ads)"
                 if not ok_post:
                     post_rejects[why[:40]] = post_rejects.get(why[:40], 0) + 1
                     continue
                 try:
                     if insert_post(conn, post):
                         posts_added += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"  [post insert ✗] {post.get('post_url', '')[:70]} → {exc}")
         except Exception as exc:
             print(f"  [!] {fn.__name__} failed: {exc}")
     print(f"[post rejects] {sorted(post_rejects.items(), key=lambda x: -x[1])[:8]}")
@@ -4611,7 +4979,7 @@ def revet_existing_posts(rules: dict) -> int:
         ok, _ = vet_post(dict(r), rules)
         head = r["poster_role"] or ""
         if ok and r["source"] in ("LinkedIn", "X/Twitter") and head and head != "Company page":
-            if (not _POSTER_TITLE.search(head)) or _FEED_HEADLINE.search(head) or is_staffing_company(head, rules) \
+            if (not _POSTER_TITLE.search(head)) or _feed_or_agency(head, rules) \
                     or re.search(r"executive search|consultanc|staffing|recruitment (?:firm|agency)|open to (?:new )?opportunit", head.lower()):
                 ok = False
         if not ok:
@@ -5033,7 +5401,10 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
 
     # 5. posts (founders / recruiters / TA — never staffing feeds) --------------
     _stage("collecting hiring posts")
-    post_fns = (collect_techreferrals, collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_linkedin_posts)
+    post_fns = (collect_techreferrals, collect_tal_club, collect_hiring_sheet, collect_hn_hiring, collect_reddit_posts, collect_onlyhiring,
+                collect_linkedin_gnews)
+    if fc_search_available():                          # Firecrawl search only exists with a cloud key; without one it always returned 0
+        post_fns += (collect_linkedin_posts,)
     if SCAN_MODE == "full":
         post_fns += (collect_linkedin_companies, collect_linkedin_search, collect_linkedin_apify)
     purge_posts_once(conn)

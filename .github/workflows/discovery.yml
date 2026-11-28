@@ -68,6 +68,24 @@ jobs:
           pip install --quiet playwright
           playwright install --with-deps chromium
 
+      - name: Cache firecrawl-local
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/firecrawl-local
+          key: firecrawl-local-0.1.0-${{ runner.os }}
+
+      - name: Start firecrawl-local (free page reader using the runner's Chrome; search stays off — that part is paid cloud only)
+        continue-on-error: true          # a failure here only means the few JavaScript-heavy sources return nothing this run
+        run: |
+          if ! command -v firecrawl-local >/dev/null; then
+            rustup toolchain install stable --profile minimal >/dev/null 2>&1 || true
+            cargo +stable install firecrawl-local --version 0.1.0 --locked || cargo +stable install firecrawl-local --version 0.1.0
+          fi
+          nohup firecrawl-local serve --port 3002 > /tmp/firecrawl.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:3002/health >/dev/null && { echo "firecrawl-local is up"; break; }; sleep 1; done
+          curl -s -X POST http://127.0.0.1:3002/v2/scrape -H 'Content-Type: application/json' \
+               -d '{"url":"https://jsgurujobs.com/jobs/?page=1","formats":["markdown"]}' | head -c 300; echo
+
       - name: Migrate database
         run: python job_hunter.py --init-db
 
