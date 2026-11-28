@@ -831,10 +831,10 @@ def location_ok(loc: str, rules: dict, jd: str | None = None) -> tuple[bool, str
         if any(_has(p, head) for p in L.get("india_places", [])) or _WORLD_OK.search(head):
             return True, "ok"
         return False, "No location given and the JD never says India or worldwide"
-    has_india = "india" in l or bool(re.search(r"(?:^|[,\s(/-])(?:in|ind)\s*\)?$", l)) or any(_has(p, l) for p in L.get("india_places", []))
+    has_india = bool(re.search(r"\bindia\b", l)) or bool(re.search(r"(?:^|[,\s(/-])(?:in|ind)\s*\)?$", l)) or any(_has(p, l) for p in L.get("india_places", []))
     if has_india and re.fullmatch(r"[a-z .'-]+,\s*in", l) and not any(_has(p, l) for p in L.get("india_places", [])):
         return False, f"Location not India-eligible: {loc} (Indiana, US)"     # "Carmel, IN" is a US state code
-    if any(_has(p, l) for p in L.get("non_india_places", [])) and "india" not in l and not re.search(r"worldwide|anywhere in the world", l):
+    if any(_has(p, l) for p in L.get("non_india_places", [])) and not re.search(r"\bindia\b", l) and not re.search(r"worldwide|anywhere in the world", l):
         return False, f"Location not India-eligible: {loc}"
     if has_india:
         return True, "ok"
@@ -5507,9 +5507,9 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
     _stage("re-checking stored jobs")
     try:
-        if _kv_get("jobs_rejudged") != "v-2026-11-28-remote":
+        if _kv_get("jobs_rejudged") != "v-2026-11-28-remote2":
             revet_existing_jobs(rules, limit=100000, stale_hours=0)     # every stored job, once, with the new rules
-            _kv_set("jobs_rejudged", "v-2026-11-28-remote")
+            _kv_set("jobs_rejudged", "v-2026-11-28-remote2")
         else:
             revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.commit()
