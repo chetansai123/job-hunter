@@ -1,0 +1,81 @@
+name: Cold email composer
+
+# Started by the dashboard's "Cold reach-out" window (GitHub Pages copy) through the GitHub API.
+# The request arrives ENCRYPTED with COMPOSE_KEY; the result goes back encrypted to the `compose` branch.
+# Writing uses your Claude plan (CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`), sending uses your Gmail App Password.
+# Nothing readable is printed: this repo is public, so its run logs are too.
+on:
+  workflow_dispatch:
+    inputs:
+      req:
+        description: 'request id (set by the dashboard)'
+        required: true
+      payload:
+        description: 'encrypted request (set by the dashboard)'
+        required: true
+
+run-name: compose ${{ inputs.req }}
+
+permissions:
+  contents: write
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      COMPOSE_REQ: ${{ inputs.req }}
+      COMPOSE_PAYLOAD: ${{ inputs.payload }}
+      COMPOSE_KEY: ${{ secrets.COMPOSE_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      COLD_EMAIL_DIR: /tmp/unused
+      SCAN_INTERVAL_MINUTES: '0'
+      AUTO_SYNC: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            job_hunter.py
+            extra_sources.py
+            rules.json
+            compose
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: |
+          pip install --quiet cryptography certifi
+          npm install --silent --global @anthropic-ai/claude-code >/dev/null 2>&1
+          claude --version
+
+      - name: Run the request (output stays encrypted)
+        run: python job_hunter.py --compose-run "$RUNNER_TEMP/result.json" > /dev/null 2>&1 || true
+
+      - name: Publish the encrypted result to the compose branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$COMPOSE_REQ" | grep -Eq '^[a-z0-9-]{8,40}$' || { echo "bad request id"; exit 1; }
+          [ -s "$RUNNER_TEMP/result.json" ] || echo '{"ok": false, "error": "the composer run crashed before writing a result"}' > "$RUNNER_TEMP/result.json"
+          if ! git ls-remote --exit-code origin compose >/dev/null 2>&1; then
+            rm -rf /tmp/cb && mkdir /tmp/cb && cd /tmp/cb
+            git init -q -b compose
+            git config user.name "job-hunter[bot]"; git config user.email "job-hunter[bot]@users.noreply.github.com"
+            echo "Encrypted cold-email composer results (read by the dashboard)." > README.md
+            git add README.md && git commit -q -m "compose branch"
+            git push -q "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" compose || true
+            cd - >/dev/null
+          fi
+          for i in 1 2 3; do
+            gh api -X PUT "repos/${{ github.repository }}/contents/results/${COMPOSE_REQ}.json" \
+              -f message="result ${COMPOSE_REQ}" -f branch=compose \
+              -f content="$(base64 -w0 "$RUNNER_TEMP/result.json")" >/dev/null && { echo "result published"; break; }
+            sleep 3
+          done

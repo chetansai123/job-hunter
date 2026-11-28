@@ -391,7 +391,22 @@
       "vietnam",
       "virginia",
       "warsaw",
-      "zurich"
+      "zurich",
+      "lahore",
+      "karachi",
+      "islamabad",
+      "rawalpindi",
+      "faisalabad",
+      "multan",
+      "shanghai",
+      "beijing",
+      "shenzhen",
+      "guangzhou",
+      "chn",
+      "malta",
+      "sao paulo",
+      "são paulo",
+      "ohio"
     ],
     "india_places": [
       "across india",
@@ -470,9 +485,7 @@
       "global",
       "apac",
       "asia",
-      "any location",
       "work from anywhere",
-      "all locations",
       "remote - india",
       "india remote"
     ]

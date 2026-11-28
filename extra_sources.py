@@ -356,6 +356,10 @@ def fetch_bamboohr(token: str, title_ok=None, with_detail: bool = True) -> list[
             continue
         l = j.get("location") or {}
         loc = ", ".join(x for x in (l.get("city"), l.get("state")) if x)
+        a = j.get("atsLocation") or {}          # where a REMOTE opening is limited to (e.g. Malta; Wooster, Ohio, United States)
+        scope = ", ".join(x for x in (a.get("city"), a.get("state") or a.get("province"), a.get("country")) if x)
+        if scope and scope.lower() not in loc.lower():
+            loc = f"{loc}, {scope}".strip(", ")
         if j.get("isRemote") or str(j.get("locationType")) == "1":
             loc += " / Remote"
         posted, desc = "", ""

@@ -285,6 +285,10 @@ def init_db() -> None:
             akey TEXT NOT NULL, post_url TEXT NOT NULL, hiring INTEGER, at TEXT,
             PRIMARY KEY (akey, post_url)
         );
+        CREATE TABLE IF NOT EXISTS outreach (           -- cold emails sent / drafted from the dashboard composer
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref_type TEXT, ref_id TEXT, company TEXT, role TEXT, job_link TEXT,
+            to_email TEXT, recipient_type TEXT, first_name TEXT, subject TEXT, mode TEXT, at TEXT
+        );
         CREATE TABLE IF NOT EXISTS workday_boards (
             host     TEXT NOT NULL,
             tenant   TEXT NOT NULL,
@@ -795,7 +799,22 @@ def is_staffing_text(text: str, rules: dict) -> str | None:
 
 
 _AMBIG_TOKENS = {"hybrid", "in", "office", "on", "site", "onsite", "n", "a", "na", "tbd", "multiple",
-                 "locations", "location", "various", "remote", "or", "and", "work", "from", "home", "wfh"}
+                 "locations", "location", "various", "remote", "or", "and", "work", "from", "home", "wfh",
+                 "any", "all", "not", "stated", "fully", "100"}
+
+# A remote job with no India place in its location must PROVE it is open worldwide / to India (user rule, 2026-11-28:
+# "if it's remote it should be worldwide remote, not restricted to a particular location").
+_WORLD_OK = re.compile(
+    r"\bworld[- ]?wide\b|anywhere in the world|(?:work|hire|hiring|apply|join us)\s+(?:\w+\s+){0,3}from\s+anywhere\b(?!\s+in\s+(?!the world))|"
+    r"globally[- ]distributed|distributed (?:team )?(?:across|around) the (?:world|globe)|(?:across|around) the globe|"
+    r"any (?:country|time ?zone|timezone)|all time ?zones|location[- ]independent|regardless of (?:your )?location|"
+    r"wherever you (?:are|live)|\bindia\b|\bapac\b|asia[- ]pacific|\bist\b|indian standard time|"
+    r"(?:global|international)(?:ly)?\s+(?:remote|hiring|candidates|applicants)|remote[- ](?:global|worldwide)", re.I)
+
+
+def _vague_remote(loc: str) -> bool:
+    words = set(re.sub(r"[^a-z0-9]+", " ", (loc or "").lower()).split())
+    return not words or words <= _AMBIG_TOKENS
 
 
 def location_ok(loc: str, rules: dict, jd: str | None = None) -> tuple[bool, str]:
@@ -804,9 +823,14 @@ def location_ok(loc: str, rules: dict, jd: str | None = None) -> tuple[bool, str
     (jd=None means 'not read yet' and defers the decision).
     Anything else (Kuwait, Americas, Ontario, Remote-AZ ...) → rejected."""
     l = (loc or "").lower().strip()
-    if not l:
-        return True, "ok"
     L = rules.get("locations", {})
+    if not l:                                    # no location at all: the JD must place it in India or say worldwide
+        if jd is None:
+            return True, "ok"
+        head = jd.lower()[:6000]
+        if any(_has(p, head) for p in L.get("india_places", [])) or _WORLD_OK.search(head):
+            return True, "ok"
+        return False, "No location given and the JD never says India or worldwide"
     has_india = "india" in l or bool(re.search(r"(?:^|[,\s(/-])(?:in|ind)\s*\)?$", l)) or any(_has(p, l) for p in L.get("india_places", []))
     if has_india and re.fullmatch(r"[a-z .'-]+,\s*in", l) and not any(_has(p, l) for p in L.get("india_places", [])):
         return False, f"Location not India-eligible: {loc} (Indiana, US)"     # "Carmel, IN" is a US state code
@@ -816,15 +840,15 @@ def location_ok(loc: str, rules: dict, jd: str | None = None) -> tuple[bool, str
         return True, "ok"
     if any(p in l for p in L.get("global_ok_phrases", [])) and not re.search(r"anywhere in (?!the world)", l):
         return True, "ok"
-    words = set(re.sub(r"[^a-z]+", " ", l).split())
+    words = set(re.sub(r"[^a-z0-9]+", " ", l).split())
     if words <= _AMBIG_TOKENS:
-        if words == {"remote"} or words <= {"remote", "or", "and"}:
-            return True, "ok"
         if jd is None:
+            return True, "ok"                    # decided once the full JD has been read
+        head = jd.lower()[:6000]
+        if any(_has(p, head) for p in L.get("india_places", [])) or _WORLD_OK.search(head):
             return True, "ok"
-        head = jd.lower()[:4000]
-        if any(_has(p, head) for p in L.get("india_places", [])):
-            return True, "ok"
+        if "remote" in words:
+            return False, f"'{loc}' but the JD never says worldwide or India (country-restricted remote)"
         return False, f"Location '{loc}' unspecified and JD never mentions India"
     return False, f"Location not India-eligible: {loc}"
 
@@ -838,7 +862,7 @@ _GEO_RESTRICT = re.compile(
     r"(?:not\s+(?:open|available)\s+to\s+(?:candidates\s+)?(?:in|from)\s+india|excluding\s+india)|"
     r"(?:authori[sz]ed|eligible|authori[sz]ation)\s+to\s+work\s+in\s+(?:the\s+)?" + _REGION + r"\b|"
     r"\b(?:us|u\.s\.)\s+citizen(?:ship)?\b|security\s+clearance|"
-    r"remote\s*\(\s*(?:the\s+)?" + _REGION + r"\b|" + _REGION + r"\s+only\b|only\s+(?:open\s+to\s+)?(?:candidates\s+)?(?:in|from)\s+(?:the\s+)?" + _REGION + r"\b|"
+    r"remote\s*\(\s*(?:the\s+)?" + _REGION + r"\b|anywhere\s+in\s+(?:the\s+)?" + _REGION + r"\b|" + _REGION + r"\s+only\b|only\s+(?:open\s+to\s+)?(?:candidates\s+)?(?:in|from)\s+(?:the\s+)?" + _REGION + r"\b|"
     r"\b(?:et|ct|pt|mt|eastern|central|pacific|mountain)(?:\s*/\s*(?:et|ct|pt|mt))*\s+time\s*zones?\b", re.I)
 
 
@@ -3533,6 +3557,8 @@ def _fetch_board_inner(board: tuple[str, str], rules: dict) -> list[dict]:
             title, url = j.get("text", ""), j.get("hostedUrl", "")
             cats = j.get("categories") or {}
             loc = cats.get("location", "") or " / ".join(cats.get("allLocations", []) or [])
+            if _vague_remote(loc) and j.get("country"):         # Lever: "Remote" + country "PL" = remote in Poland only
+                loc = f"Remote ({j['country']})"
             if not url or not _prefilter(title, company, url, loc, rules):
                 continue
             lists = " ".join(f"{x.get('text','')} {_html_to_text(x.get('content',''))}" for x in j.get("lists", []))
@@ -3565,6 +3591,8 @@ def _fetch_board_inner(board: tuple[str, str], rules: dict) -> list[dict]:
             loc = j.get("location", "") or ""
             if j.get("isRemote") and "remote" not in loc.lower():
                 loc = (loc + " / Remote").strip(" /")
+            if _vague_remote(loc) and _ashby_countries(j):      # Ashby: "Remote" + address/secondary countries = remote there
+                loc = f"Remote ({', '.join(_ashby_countries(j))[:120]})"
             if not url or not _prefilter(title, company, url, loc, rules):
                 continue
             comp = (j.get("compensation") or {}).get("compensationTierSummary", "") or ""
@@ -4898,6 +4926,42 @@ def ingest_posts(conn: sqlite3.Connection, rules: dict, fns, per_source: dict | 
     return posts_added, post_rejects
 
 
+def _ashby_countries(j: dict) -> list[str]:
+    out: list[str] = []
+    for a in [j.get("address")] + [x.get("address") for x in (j.get("secondaryLocations") or []) if isinstance(x, dict)]:
+        c = ((a or {}).get("postalAddress") or {}).get("addressCountry") or ""
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+_ASHBY_BOARD: dict[str, list] = {}
+
+
+def _ats_remote_scope(url: str) -> str:
+    """Countries a 'Remote' posting is actually limited to, read from the job system's own data
+    (BambooHR atsLocation, Lever country, Ashby address + secondary locations). '' when none is given."""
+    u = urllib.parse.urlparse(url or "")
+    host, segs = u.netloc.lower(), [x for x in u.path.split("/") if x]
+    try:
+        if host.endswith(".bamboohr.com") and len(segs) >= 2 and segs[0] == "careers":
+            d = http_get(f"https://{host}/careers/{segs[1]}/detail", timeout=15, quiet=True)
+            a = ((((d or {}).get("result") or {}).get("jobOpening") or {}).get("atsLocation") or {}) if isinstance(d, dict) else {}
+            return ", ".join(x for x in (a.get("city"), a.get("state"), a.get("country")) if x)
+        if host == "jobs.lever.co" and len(segs) >= 2:
+            d = http_get(f"https://api.lever.co/v0/postings/{segs[0]}/{segs[1]}", timeout=15, quiet=True)
+            return (d.get("country") or "") if isinstance(d, dict) else ""
+        if host == "jobs.ashbyhq.com" and len(segs) >= 2:
+            if segs[0] not in _ASHBY_BOARD:
+                d = http_get(f"https://api.ashbyhq.com/posting-api/job-board/{segs[0]}", timeout=20, quiet=True)
+                _ASHBY_BOARD[segs[0]] = (d.get("jobs") or []) if isinstance(d, dict) else []
+            j = next((x for x in _ASHBY_BOARD[segs[0]] if segs[1] in (x.get("jobUrl") or "") or x.get("id") == segs[1]), None)
+            return ", ".join(_ashby_countries(j)) if j else ""
+    except Exception:
+        return ""
+    return ""
+
+
 def revet_existing_jobs(rules: dict, limit: int | None = None, stale_hours: float = 24) -> dict:
     conn = get_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -4916,6 +4980,10 @@ def revet_existing_jobs(rules: dict, limit: int | None = None, stale_hours: floa
         if r["posted_date"] and (days_ago(r["posted_date"]) or 0) > rules.get("freshness", {}).get("max_age_days", 40):
             return r, None, f"stale posting (opened {r['posted_date']})"
         loc = r["location"] if r["location"] and r["location"] != "Remote / not stated" else ""
+        if _vague_remote(loc) and "remote" in (loc or r["location"] or "").lower():
+            scope = _ats_remote_scope(r["direct_apply_url"])     # "Remote" that the job system limits to some country
+            if scope:
+                loc = f"Remote ({scope})"
         if r["posted_date"]:                       # verified when it was stored (job systems whose page has no date)
             _POSTED_CACHE.setdefault(r["direct_apply_url"], r["posted_date"][:10])
         j = _job(r["company"], r["title"], r["direct_apply_url"], "revet", rules, location=loc, need_fetch=True,
@@ -5439,9 +5507,9 @@ def _run_full_scan(custom_urls: list[str] | None) -> dict:
     # 6. keep stored jobs honest: re-open the stalest ones (closed? filter changed? direct link now resolvable?)
     _stage("re-checking stored jobs")
     try:
-        if _kv_get("jobs_rejudged") != "v-2026-11-27":
+        if _kv_get("jobs_rejudged") != "v-2026-11-28-remote":
             revet_existing_jobs(rules, limit=100000, stale_hours=0)     # every stored job, once, with the new rules
-            _kv_set("jobs_rejudged", "v-2026-11-27")
+            _kv_set("jobs_rejudged", "v-2026-11-28-remote")
         else:
             revet_existing_jobs(rules, limit=60 if SCAN_MODE == "full" else 30, stale_hours=24)
         conn.commit()
@@ -6697,6 +6765,47 @@ a.chip.search{background:#161b26;color:#94a3b8;border-color:#334155;}
 a.apply-btn.board{background:#92400e;}
 #scanBanner{display:none;background:#1e1b4b;border:1px solid #4338ca;color:#c7d2fe;border-radius:9px;
             padding:9px 13px;font-size:13px;margin-bottom:12px;}
+/* cold reach-out composer (Gmail-style) */
+#cmp{position:fixed;inset:0;background:rgba(3,6,12,.62);z-index:9000;display:none;align-items:center;justify-content:center;padding:18px;}
+#cmp.open{display:flex;}
+.cmp-win{background:#fff;color:#202124;width:min(860px,100%);max-height:96vh;border-radius:12px;display:flex;flex-direction:column;overflow-y:auto;
+         box-shadow:0 12px 48px rgba(0,0,0,.55);font-family:"Google Sans",Roboto,-apple-system,Arial,sans-serif;}
+.cmp-head{background:#f2f6fc;padding:11px 16px;display:flex;justify-content:space-between;align-items:center;font-size:14px;font-weight:600;}
+.cmp-head button{background:0;color:#444;font-size:18px;padding:0 6px;}
+.cmp-ctx{background:#f8fafd;border-bottom:1px solid #e3e8ef;padding:10px 16px;display:grid;gap:8px;
+         grid-template-columns:1fr 1fr;}
+.cmp-ctx label{font-size:11px;color:#5f6368;display:grid;gap:3px;}
+.cmp-ctx input,.cmp-ctx select{background:#fff;color:#202124;border:1px solid #dadce0;border-radius:6px;padding:7px 9px;font-size:13px;}
+.cmp-ctx .full{grid-column:1/-1;}
+.cmp-ctx .gen{grid-column:1/-1;display:flex;gap:10px;align-items:center;}
+.cmp-ctx .gen button{background:#0b57d0;border-radius:18px;padding:8px 18px;white-space:nowrap;flex:none;}
+.cmp-ctx .gen{flex-wrap:wrap;}
+.cmp-ctx .gen button:disabled{opacity:.55;cursor:wait;}
+.cmp-row{display:flex;align-items:center;border-bottom:1px solid #f1f3f4;padding:0 16px;min-height:38px;font-size:14px;}
+.cmp-row span.k{color:#5f6368;width:62px;flex:none;font-size:13px;}
+.cmp-row input{flex:1;border:0;background:transparent;color:#202124;padding:9px 0;font-size:14px;outline:none;min-width:0;}
+.cmp-row .v{color:#202124;font-size:14px;}
+#cmpBody{flex:1 0 auto;min-height:220px;overflow:auto;padding:14px 16px;font-size:14px;line-height:1.55;outline:none;color:#202124;}
+#cmpBody p{margin:0 0 11px;} #cmpBody ul{margin:0 0 11px 22px;} #cmpBody a{color:#0b57d0;}
+.cmp-att{padding:0 16px 8px;display:flex;gap:8px;align-items:center;font-size:13px;}
+.cmp-att label{background:#f1f3f4;border-radius:6px;padding:5px 10px;display:flex;gap:6px;align-items:center;cursor:pointer;}
+.cmp-flags{margin:0 16px 8px;background:#fef7e0;border:1px solid #f9e3a0;color:#5c4400;border-radius:8px;padding:8px 11px;font-size:12px;display:none;}
+.cmp-flags.show{display:block;} .cmp-flags ul{margin:4px 0 0 18px;} .cmp-flags a{color:#5c4400;}
+.cmp-warn{margin:0 16px 8px;background:#fce8e6;color:#a50e0e;border-radius:8px;padding:7px 11px;font-size:12px;display:none;}
+.cmp-warn.show{display:block;}
+.cmp-foot{padding:10px 16px 14px;display:flex;gap:9px;align-items:center;flex-wrap:wrap;border-top:1px solid #f1f3f4;}
+.cmp-foot .send{background:#0b57d0;border-radius:18px;padding:9px 22px;}
+.cmp-foot .lite{background:#fff;color:#0b57d0;border:1px solid #dadce0;border-radius:18px;}
+.cmp-foot button:disabled{opacity:.5;cursor:not-allowed;}
+#cmpStatus{font-size:12px;color:#5f6368;flex:1;min-width:160px;}
+.cmp-note{padding:8px 16px;background:#e8f0fe;color:#174ea6;font-size:12px;display:none;} .cmp-note.show{display:block;}
+.cmp-note a{color:#174ea6;font-weight:600;cursor:pointer;}
+.cmp-ctx .gen select{padding:7px 8px;}
+.cmp-cloud{display:none;padding:10px 16px;background:#f8fafd;border-bottom:1px solid #e3e8ef;font-size:12px;color:#3c4043;gap:7px;}
+.cmp-cloud.show{display:grid;} .cmp-cloud input{background:#fff;color:#202124;border:1px solid #dadce0;border-radius:6px;padding:7px 9px;font-size:13px;}
+.cmp-cloud button{background:#0b57d0;border-radius:18px;justify-self:start;}
+.cmp-cloud label{display:grid;gap:3px;font-size:11px;color:#5f6368;} .cmp-cloud code{background:#e8eaed;padding:1px 5px;border-radius:4px;}
+@media (max-width:640px){ .cmp-ctx{grid-template-columns:1fr;} }
 </style>
 </head>
 <body>
@@ -6836,6 +6945,57 @@ a.apply-btn.board{background:#92400e;}
 </div>
 </div>
 
+<!-- ─── COLD REACH-OUT COMPOSER ──────────────────────────────── -->
+<div id="cmp" onclick="if(event.target===this) closeCompose()">
+ <div class="cmp-win">
+  <div class="cmp-head"><span>✉ Cold reach-out</span><button onclick="closeCompose()" title="Close">✕</button></div>
+  <div class="cmp-note" id="cmpNote"></div>
+  <div class="cmp-cloud" id="cmpCloud">
+    <b>Cloud composer setup (once per browser)</b>
+    <span>1. On your Mac, run <code>./setup_cloud_composer.sh</code> once. It prints your compose key.</span>
+    <span>2. Create a GitHub token: <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com → fine-grained token</a>,
+      repository access: only <b id="cmpRepoName">job-hunter</b>; permissions: <b>Actions: Read and write</b>, <b>Contents: Read-only</b>.</span>
+    <label>GitHub token <input id="cmpGhTok" type="password" placeholder="github_pat_…" autocomplete="off"/></label>
+    <label>Compose key <input id="cmpKey" type="password" placeholder="printed by setup_cloud_composer.sh" autocomplete="off"/></label>
+    <span>Both stay in this browser only (localStorage). Generate and Send then run on GitHub Actions with your Claude plan and Gmail.</span>
+    <button onclick="saveCloudSetup()">Save</button>
+  </div>
+  <div class="cmp-ctx">
+    <label>Company<input id="cmpCompany"/></label>
+    <label>Role<input id="cmpRole"/></label>
+    <label class="full">Job link<input id="cmpLink" placeholder="https://…"/></label>
+    <label>Who you're writing to
+      <select id="cmpType">
+        <option value="founder">Founder / co-founder</option>
+        <option value="recruiter">Recruiter / HR</option>
+        <option value="referral">Employee (asking for a referral)</option>
+      </select></label>
+    <label>Their first name<input id="cmpName" placeholder="e.g. Priya"/></label>
+    <div class="gen"><button id="cmpGen" onclick="generateEmail()">✨ Generate</button>
+      <select id="cmpModel" title="Model that writes the email" onchange="localStorage.setItem('jh_cmp_model',this.value)">
+        <option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select>
+      <select id="cmpEffort" title="Effort level" onchange="localStorage.setItem('jh_cmp_effort',this.value)">
+        <option value="low">low effort</option><option value="medium">medium effort</option><option value="high">high effort</option>
+        <option value="xhigh">xhigh effort</option><option value="max">max effort</option></select>
+      <span id="cmpGenStatus" style="font-size:12px;color:#5f6368">Uses your ColdEmail rules; researches the company first (1–2 min).</span></div>
+  </div>
+  <div class="cmp-row"><span class="k">From</span><span class="v" id="cmpFrom">—</span></div>
+  <div class="cmp-row"><span class="k">To</span><input id="cmpTo" placeholder="name@company.com" oninput="checkRepeat()"/></div>
+  <div class="cmp-row"><span class="k">Subject</span><input id="cmpSubject"/></div>
+  <div class="cmp-warn" id="cmpWarn"></div>
+  <div id="cmpBody" contenteditable="true"></div>
+  <div class="cmp-flags" id="cmpFlags"></div>
+  <div class="cmp-att"><label><input type="checkbox" id="cmpAttach" checked/> 📎 <span id="cmpResume">resume</span></label></div>
+  <div class="cmp-foot">
+    <button class="send" id="cmpSend" onclick="sendEmail('send')">Send</button>
+    <button class="lite" id="cmpDraft" onclick="sendEmail('draft')" title="Puts it in your Gmail Drafts; you press Send in Gmail">Save as Gmail draft</button>
+    <button class="lite" onclick="openInGmail()" title="Opens Gmail's own compose window (plain text, no attachment)">Open in Gmail ↗</button>
+    <button class="lite" onclick="copyEmail()">Copy</button>
+    <span id="cmpStatus"></span>
+  </div>
+ </div>
+</div>
+
 <script>
 let allJobs=[], allPosts=[], allStartups=[], META={}, tab='jobs';
 
@@ -6926,7 +7086,7 @@ function renderStartups(){
       <div class="sub">${esc([s.sector,s.subsector,s.model].filter(Boolean).join(' · '))}${s.hq?' · 📍 '+esc(s.hq):''}${s.founded?' · since '+esc(s.founded):''}</div></div>
     <div class="badges"><span class="badge score">⭐ ${s.score||0}/10</span>
       ${s.funded_on?`<span class="badge direct">💰 ${esc(s.amount||'undisclosed')} ${esc(s.round||'')}</span><span class="badge">📅 ${esc(s.funded_on)}</span>`
-                   :`<span class="badge direct">${s.source==='yc'?'🟧 YC '+esc(s.round||''):esc(s.source||'startup')}</span>`}${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}</div>
+                   :`<span class="badge direct">${s.source==='yc'?'🟧 YC '+esc(s.round||''):esc(s.source||'startup')}</span>`}${s.size&&s.size.count?`<span class="badge" title="people on LinkedIn">👥 ${s.size.count}${s.size.range?' ('+esc(s.size.range)+')':''}</span>`:''}${statusBadge(s.status||'new')}${outreachBadge('startup',s.key)}</div>
   </div>
   ${s.description?`<div class="reason">${esc(s.description.slice(0,260))}</div>`:''}
   <div class="meta">${s.investors?`<span>🏦 ${esc(s.investors)}</span>`:''}</div>
@@ -6941,6 +7101,7 @@ function renderStartups(){
   ${(s.hiring_posts||[]).map(p=>`<div class="notes">📢 Hiring post ${esc(p.date||'')}: ${esc(p.text.slice(0,160))}… <a href="${esc(p.url)}" target="_blank">View ↗</a></div>`).join('')}
   <div class="actions">
     ${link(s.careers,'Careers page')}${link(s.website,'Website')}${link(s.linkedin,'LinkedIn')}${link(s.inc42,'Profile')}${link(s.article,'Funding news')}
+    ${reachBtn('startup',s.key)}
     <button class="ok"   onclick="setStartupStatus('${esc(s.key)}','contacted')">✉ Contacted</button>
     <button class="warn" onclick="setStartupStatus('${esc(s.key)}','saved')">★ Save</button>
     <button class="bad"  onclick="setStartupStatus('${esc(s.key)}','rejected')">✗ Hide</button>
@@ -6955,7 +7116,7 @@ async function setStartupStatus(key,s){
 async function loadMeta(){ try{ META=await (await fetch('/api/meta')).json(); }catch(e){ META={}; } }
 
 async function refresh(){
-  await loadMeta();
+  await loadMeta(); await loadOutreach();
   await Promise.all([loadJobs(), loadPosts(), loadStartups()]);
   document.getElementById('lastScan').textContent =
     'Last refreshed: '+new Date().toLocaleTimeString()+' · '+(window.__jhNote ? window.__jhNote() : 'auto-syncs with the cloud every 10 min');
@@ -7058,7 +7219,7 @@ function renderJobs(){
       <span class="badge ${j.link_type==='email'?'board':'direct'}">${j.link_type==='email'?'✉ apply by email':'✅ direct link'}</span>
       ${j.locked?'<span class="badge lock">🔒 may need login</span>':''}
       <span class="badge">${esc(j.role_category)}</span>
-      ${statusBadge(j.status)}
+      ${statusBadge(j.status)}${outreachBadge('job',j.id)}
       <span class="badge ${srcClass(j.discovery_source)}" style="font-size:10px">${esc(j.discovery_source.split(':')[0])}</span>
     </div>
   </div>
@@ -7076,6 +7237,7 @@ function renderJobs(){
       ? `<a class="apply-btn" href="mailto:${esc(j.apply_email)}?subject=${encodeURIComponent('Application: '+j.title)}">✉ Email ${esc(j.apply_email)}</a>`
       : `<a class="apply-btn" href="${esc(j.direct_apply_url)}" target="_blank" rel="noopener">Direct Apply ↗</a>${j.apply_email?`<a class="view-btn" href="mailto:${esc(j.apply_email)}">✉ ${esc(j.apply_email)}</a>`:''}`}
     ${j.link_status==='unverified'?'<span class="badge">couldn\'t verify page is live</span>':''}
+    ${reachBtn('job',j.id)}
     <button class="ok"   onclick="setJobStatus(${j.id},'applied')">✓ Applied</button>
     <button class="warn" onclick="setJobStatus(${j.id},'saved')">★ Save</button>
     <button class="bad"  onclick="setJobStatus(${j.id},'rejected')">✗ Reject</button>
@@ -7108,7 +7270,7 @@ function renderPosts(){
 <div class="post">
   <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;">
     <div class="post-src">${esc(p.source)}${p.posted_at?' · '+esc(p.posted_at):''}</div>
-    ${statusBadge(p.status)}
+    <div class="badges">${statusBadge(p.status)}${outreachBadge('post',p.id)}</div>
   </div>
   <div class="post-name">${esc(p.poster_name||'Anonymous')}</div>
   <div class="post-role">${esc(p.poster_role)}</div>
@@ -7118,12 +7280,197 @@ function renderPosts(){
   <div class="pactions">
     <a class="view-btn" href="${esc(p.post_url)}" target="_blank" rel="noopener">View Post ↗</a>
     ${p.poster_url&&p.poster_url!==p.post_url?`<a class="view-btn" href="${esc(p.poster_url)}" target="_blank">Profile ↗</a>`:''}
+    ${reachBtn('post',p.id)}
     <button class="ok"   onclick="setPStatus(${p.id},'contacted')" style="font-size:12px">✉ Contacted</button>
     <button class="warn" onclick="setPStatus(${p.id},'saved')"     style="font-size:12px">★ Save</button>
     <button class="sec"  onclick="document.getElementById('pb${p.id}').classList.toggle('exp')" style="font-size:12px">▼ More</button>
     <button class="sec"  onclick="setPStatus(${p.id},'deleted')" style="font-size:12px">🗑 Delete</button>
   </div>
 </div>`).join('')+pagerHtml('posts',f.length,'renderPosts');
+}
+
+/* ─── cold reach-out composer ─── */
+let CMP_CFG=null, OUTREACH=[], CMP={};
+const IS_STATIC = typeof window.__jhNote === 'function';          // the GitHub Pages copy (no server behind it)
+async function loadOutreach(){
+  if(IS_STATIC){ try{ OUTREACH=JSON.parse(localStorage.getItem('jh_outreach')||'[]'); }catch(e){ OUTREACH=[]; } return; }
+  try{ const d=await (await fetch('/api/outreach')).json(); OUTREACH=Array.isArray(d)?d:[]; }catch(e){ OUTREACH=[]; } }
+/* cloud composer: encrypted request → GitHub Actions → encrypted result on the `compose` branch */
+function ghRepo(){ const saved=localStorage.getItem('jh_gh_repo'); if(saved) return saved;
+  const owner=location.hostname.split('.')[0], name=location.pathname.split('/').filter(Boolean)[0]||'job-hunter';
+  return owner+'/'+name; }
+function cloudReady(){ return IS_STATIC && !!localStorage.getItem('jh_gh_token') && !!localStorage.getItem('jh_compose_key'); }
+function saveCloudSetup(){
+  const t=document.getElementById('cmpGhTok').value.trim(), k=document.getElementById('cmpKey').value.trim();
+  if(t) localStorage.setItem('jh_gh_token',t); if(k) localStorage.setItem('jh_compose_key',k);
+  document.getElementById('cmpCloud').className='cmp-cloud';
+  openCompose(CMP.type,CMP.id,true);
+}
+function toggleCloudSetup(){ const c=document.getElementById('cmpCloud'); c.className=c.className.includes('show')?'cmp-cloud':'cmp-cloud show';
+  document.getElementById('cmpRepoName').textContent=ghRepo(); }
+const _b64=u=>btoa(String.fromCharCode(...u)), _unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function _ckKey(pass,salt,iter){ const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']); }
+async function ckEnc(obj,pass){ const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12)), iter=100000;
+  const k=await _ckKey(pass,salt,iter); const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,new TextEncoder().encode(JSON.stringify(obj))));
+  return JSON.stringify({v:1,iter,salt:_b64(salt),iv:_b64(iv),ct:_b64(ct)}); }
+async function ckDec(b,pass){ const k=await _ckKey(pass,_unb64(b.salt),b.iter||250000);
+  return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:_unb64(b.iv)},k,_unb64(b.ct)))); }
+async function cloudCall(action,payload,onTick){
+  const tok=localStorage.getItem('jh_gh_token'), key=localStorage.getItem('jh_compose_key'), repo=ghRepo();
+  const req=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).toLowerCase();
+  const enc=await ckEnc({...payload,action,req},key);
+  const H={'Authorization':'Bearer '+tok,'X-GitHub-Api-Version':'2022-11-28'};
+  const r=await fetch(`https://api.github.com/repos/${repo}/actions/workflows/compose.yml/dispatches`,
+    {method:'POST',headers:{...H,'Accept':'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({ref:'main',inputs:{req,payload:enc}})});
+  if(r.status!==204) throw new Error(`GitHub didn't start the run (${r.status}): ${(await r.text()).slice(0,160)}`);
+  const t0=Date.now();
+  while(Date.now()-t0<12*60*1000){
+    await new Promise(res=>setTimeout(res,5000)); if(onTick) onTick(Math.round((Date.now()-t0)/1000));
+    const q=await fetch(`https://api.github.com/repos/${repo}/contents/results/${req}.json?ref=compose&_=${Date.now()}`,
+      {headers:{...H,'Accept':'application/vnd.github.raw+json'},cache:'no-store'});
+    if(q.status===200){ const blob=JSON.parse(await q.text()); return blob.ct ? await ckDec(blob,key) : blob; }
+    if(q.status===401||q.status===403) throw new Error('GitHub token rejected ('+q.status+'): check its permissions');
+  }
+  throw new Error('no result after 12 minutes: look at the "Cold email composer" runs in the repo\'s Actions tab');
+}
+function outreachFor(type,id){ return OUTREACH.find(o=>o.ref_type===type && String(o.ref_id)===String(id)); }
+function outreachBadge(type,id){ const o=outreachFor(type,id); if(!o) return '';
+  return `<span class="badge sa" title="${esc(o.subject)} → ${esc(o.to_email)}">✉ ${o.mode==='sent'?'emailed':'draft'} ${esc((o.at||'').slice(5,10))}</span>`; }
+function reachBtn(type,id){ return `<button class="purple" onclick="openCompose('${type}','${esc(String(id))}')" title="Write and send a cold email for this">✉ Cold reach-out</button>`; }
+const EMAIL_RE=/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+function firstEmail(t){ const m=(t||'').match(EMAIL_RE)||[]; return m.find(e=>!/(example|domain|email)\.com$|\.(png|jpg|gif)$/i.test(e))||''; }
+function guessType(role){ const r=(role||'').toLowerCase();
+  if(/founder|\bceo\b|\bcto\b|owner|director/.test(r)) return 'founder';
+  if(/recruit|talent|\bhr\b|human resources|people|hiring|acquisition/.test(r)) return 'recruiter';
+  return 'recruiter'; }
+function firstName(n){ n=(n||'').trim(); if(!n||/anonymous|^u\/|^@/i.test(n)) return ''; return n.split(/\s+/)[0].replace(/[^A-Za-zÀ-ɏ'-]/g,''); }
+
+async function openCompose(type,id,keep){
+  if(!CMP_CFG){ try{ CMP_CFG=IS_STATIC?{}:await (await fetch('/api/compose/config')).json(); }catch(e){ CMP_CFG={}; } }
+  const local=!!CMP_CFG.local, cloud=cloudReady();
+  if(keep){ applyComposeState(local,cloud); return; }
+  let d={company:'',role:'',link:'',type:'recruiter',name:'',to:'',context:''};
+  if(type==='job'){ const j=allJobs.find(x=>String(x.id)===String(id)); if(!j) return;
+    d={company:j.company,role:j.title,link:j.direct_apply_url,type:j.founder_email&&!j.apply_email?'founder':'recruiter',
+       name:j.founder_email&&!j.apply_email?firstName(j.founder_name):'', to:j.apply_email||j.founder_email||'',
+       context:[`${j.title} at ${j.company}`, j.location&&('Location: '+j.location), j.experience_req&&('Experience: '+j.experience_req), j.salary&&('Salary: '+j.salary), j.match_reason].filter(Boolean).join('\n')};
+  } else if(type==='post'){ const p=allPosts.find(x=>String(x.id)===String(id)); if(!p) return;
+    const isCo=/company page|^@|hiring$/i.test(p.poster_role||'') || /^[a-z0-9.-]+$/.test(p.poster_name||'');   // a company account, not a person
+    d={company:isCo?(p.poster_name||''):'',role:'',link:p.post_url,type:guessType(p.poster_role),name:isCo?'':firstName(p.poster_name),to:firstEmail(p.post_text),
+       context:`Hiring post by ${p.poster_name||'someone'}${p.poster_role?' ('+p.poster_role+')':''} on ${p.source}:\n${p.post_text}`};
+  } else { const s=allStartups.find(x=>String(x.key)===String(id)); if(!s) return;
+    const dev=(s.roles&&s.roles.dev)||[], f=(s.founder_links||[])[0];
+    d={company:s.name,role:dev[0]?dev[0].title:'Software Engineer (React / Node.js)',link:dev[0]?dev[0].url:(s.careers||s.website||''),
+       type:'founder',name:f?firstName(f.name):'',to:((s.emails||[])[0]||{}).email||'',
+       context:[`${s.name}: ${s.description||''}`, s.sector&&('Sector: '+s.sector), s.funded_on&&(`Funding: ${s.amount||''} ${s.round||''} on ${s.funded_on}`), s.investors&&('Investors: '+s.investors), dev.length&&('Open developer roles: '+dev.map(r=>r.title).join(', '))].filter(Boolean).join('\n')};
+  }
+  CMP={type,id,context:d.context};
+  const g=x=>document.getElementById(x);
+  g('cmpCompany').value=d.company||''; g('cmpRole').value=d.role||''; g('cmpLink').value=d.link||'';
+  g('cmpType').value=d.type; g('cmpName').value=d.name||''; g('cmpTo').value=d.to||'';
+  g('cmpSubject').value=''; g('cmpBody').innerHTML=''; g('cmpFlags').className='cmp-flags'; g('cmpStatus').textContent='';
+  g('cmpModel').value=localStorage.getItem('jh_cmp_model')||CMP_CFG.model||'sonnet';
+  g('cmpEffort').value=localStorage.getItem('jh_cmp_effort')||CMP_CFG.effort||'medium';
+  applyComposeState(local,cloud);
+  checkRepeat();
+  g('cmp').classList.add('open');
+  (d.to?g('cmpName'):g('cmpTo')).focus();
+}
+function applyComposeState(local,cloud){
+  const g=x=>document.getElementById(x), note=g('cmpNote');
+  g('cmpFrom').textContent = CMP_CFG.from ? `${CMP_CFG.from_name||''} <${CMP_CFG.from}>` : (local?'set GMAIL_ADDRESS in .env':'your Gmail (from the GMAIL_ADDRESS repo secret)');
+  g('cmpResume').textContent = CMP_CFG.resume || 'your resume (from the ColdEmail kit)';
+  if(IS_STATIC && !cloud){ note.innerHTML='To write and send from this page, connect the cloud composer once. <a onclick="toggleCloudSetup()">Set it up</a>. Until then, use "Open in Gmail" or "Copy".'; note.className='cmp-note show'; }
+  else if(IS_STATIC){ note.innerHTML='Runs on GitHub Actions with your Claude plan and Gmail (about 2–3 min). <a onclick="toggleCloudSetup()">Cloud settings</a>'; note.className='cmp-note show'; }
+  else if(!CMP_CFG.can_send){ note.textContent='To send from here, add GMAIL_ADDRESS and GMAIL_APP_PASSWORD (a Gmail App Password) to .env and restart the dashboard. Until then use "Open in Gmail" or "Copy".'; note.className='cmp-note show'; }
+  else if(!CMP_CFG.can_generate){ note.textContent='Generate needs the Claude Code CLI and ~/ClaudeProjects/ColdEmail/CLAUDE.md on this Mac.'; note.className='cmp-note show'; }
+  else note.className='cmp-note';
+  g('cmpGen').disabled=!((local&&CMP_CFG.can_generate)||cloud);
+  g('cmpSend').disabled=g('cmpDraft').disabled=!((local&&CMP_CFG.can_send)||cloud);
+  g('cmpAttach').disabled=!(CMP_CFG.resume||cloud);
+}
+function closeCompose(){ document.getElementById('cmp').classList.remove('open'); }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape' && document.getElementById('cmp').classList.contains('open')) closeCompose(); });
+function checkRepeat(){
+  const to=document.getElementById('cmpTo').value.trim().toLowerCase(), w=document.getElementById('cmpWarn');
+  const prev=to && OUTREACH.find(o=>o.mode==='sent' && (o.to_email||'').toLowerCase()===to);
+  const same=outreachFor(CMP.type,CMP.id);
+  if(prev){ w.textContent=`You already emailed ${prev.to_email} on ${prev.at.slice(0,10)} ("${prev.subject}").`; w.className='cmp-warn show'; }
+  else if(same){ w.textContent=`You already ${same.mode==='sent'?'emailed':'drafted an email to'} ${same.to_email} for this on ${same.at.slice(0,10)}.`; w.className='cmp-warn show'; }
+  else w.className='cmp-warn';
+}
+async function generateEmail(){
+  const g=x=>document.getElementById(x), btn=g('cmpGen'), st=g('cmpGenStatus');
+  btn.disabled=true; const t0=Date.now(); btn.textContent='✨ Writing…';
+  const tick=IS_STATIC?null:setInterval(()=>{ st.textContent=`Researching the company and writing… ${Math.round((Date.now()-t0)/1000)} s`; },1000);
+  if(IS_STATIC) st.textContent='Starting a GitHub Actions run…';
+  try{
+    const body={company:g('cmpCompany').value, role:g('cmpRole').value, job_link:g('cmpLink').value, recipient_type:g('cmpType').value,
+      first_name:g('cmpName').value, to:g('cmpTo').value, context:(CMP.context||'').slice(0,4000), model:g('cmpModel').value, effort:g('cmpEffort').value};
+    const d = IS_STATIC
+      ? await cloudCall('generate', body, s=>{ st.textContent=`Running on GitHub Actions… ${s} s (usually 2–3 min)`; })
+      : await (await fetch('/api/compose/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok){ st.textContent='⚠️ '+(d.error||'failed'); return; }
+    g('cmpSubject').value=d.subject||''; g('cmpBody').innerHTML=d.body_html||'';
+    if(!g('cmpCompany').value && d.company) g('cmpCompany').value=d.company;
+    if(!g('cmpRole').value && d.role) g('cmpRole').value=d.role;
+    const fl=g('cmpFlags');
+    if((d.flags||[]).length || (d.sources||[]).length){
+      fl.innerHTML=(d.flags.length?'<b>Before you send</b><ul>'+d.flags.map(f=>`<li>${esc(f)}</li>`).join('')+'</ul>':'')+
+        (d.sources.length?'<div style="margin-top:4px">Sources: '+d.sources.map((u,i)=>`<a href="${esc(u)}" target="_blank" rel="noopener">${i+1}</a>`).join(' · ')+'</div>':'');
+      fl.className='cmp-flags show';
+    }
+    st.textContent=`Done in ${Math.round((Date.now()-t0)/1000)} s with ${d.model||''} ${d.effort?'('+d.effort+')':''}. Edit anything before sending.`;
+  }catch(e){ st.textContent='⚠️ '+e; }
+  finally{ if(tick) clearInterval(tick); btn.disabled=false; btn.textContent='✨ Generate again'; }
+}
+async function sendEmail(mode,confirmRepeat){
+  const g=x=>document.getElementById(x), st=g('cmpStatus');
+  const payload={mode, to:g('cmpTo').value.trim(), subject:g('cmpSubject').value.trim(), body_html:g('cmpBody').innerHTML,
+    attach_resume:g('cmpAttach').checked, company:g('cmpCompany').value, role:g('cmpRole').value, job_link:g('cmpLink').value,
+    recipient_type:g('cmpType').value, first_name:g('cmpName').value, ref:{type:CMP.type,id:CMP.id}, confirm_repeat:!!confirmRepeat};
+  if(/\[First name\]/i.test(g('cmpBody').innerText) && !confirm('The email still says "[First name]". Send anyway?')) return;
+  if(IS_STATIC && mode==='send' && !confirmRepeat){
+    const prev=OUTREACH.find(o=>o.mode==='sent' && (o.to_email||'').toLowerCase()===payload.to.toLowerCase());
+    if(prev && !confirm(`You already emailed ${prev.to_email} on ${prev.at.slice(0,10)}. Send again?`)) return;
+  }
+  g('cmpSend').disabled=g('cmpDraft').disabled=true; st.textContent=mode==='send'?'Sending…':'Saving to Gmail Drafts…';
+  try{
+    const d = IS_STATIC
+      ? await cloudCall(mode, payload, s=>{ st.textContent=`${mode==='send'?'Sending':'Saving the draft'} via GitHub Actions… ${s} s`; })
+      : await (await fetch('/api/compose/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
+    if(IS_STATIC && d.ok){
+      const log=JSON.parse(localStorage.getItem('jh_outreach')||'[]');
+      log.unshift({ref_type:CMP.type,ref_id:String(CMP.id),to_email:payload.to,subject:payload.subject,mode:d.mode,at:new Date().toISOString()});
+      localStorage.setItem('jh_outreach',JSON.stringify(log.slice(0,2000)));
+      if(d.mode==='sent' && (CMP.type==='post'||CMP.type==='startup'))
+        await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:CMP.type==='post'?Number(CMP.id):CMP.id,status:'contacted',type:CMP.type})});
+    }
+    if(d.repeat){ g('cmpSend').disabled=g('cmpDraft').disabled=false;
+      if(confirm(d.error+'. Send again?')) return sendEmail(mode,true); st.textContent='Not sent.'; return; }
+    if(!d.ok){ st.textContent='⚠️ '+(d.error||'failed'); g('cmpSend').disabled=g('cmpDraft').disabled=false; return; }
+    st.textContent = d.mode==='sent' ? `✅ Sent to ${payload.to}` : '✅ Saved in your Gmail Drafts';
+    await loadOutreach();
+    if(CMP.type==='post') await loadPosts(); else if(CMP.type==='startup') await loadStartups(); else renderJobs();
+    setTimeout(closeCompose,1400);
+  }catch(e){ st.textContent='⚠️ '+e; g('cmpSend').disabled=g('cmpDraft').disabled=false; }
+}
+function openInGmail(){
+  const g=x=>document.getElementById(x);
+  const u='https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(g('cmpTo').value.trim())+
+          '&su='+encodeURIComponent(g('cmpSubject').value)+'&body='+encodeURIComponent(g('cmpBody').innerText);
+  window.open(u,'_blank','noopener');
+}
+function copyEmail(){
+  const body=document.getElementById('cmpBody').cloneNode(true);
+  body.querySelectorAll('*').forEach(n=>{ n.removeAttribute('style'); n.removeAttribute('class'); });
+  const html=body.innerHTML, text=document.getElementById('cmpBody').innerText;
+  const h=e=>{ e.clipboardData.setData('text/html',html); e.clipboardData.setData('text/plain',text); e.preventDefault(); };
+  document.addEventListener('copy',h); const ok=document.execCommand('copy'); document.removeEventListener('copy',h);
+  if(!ok && navigator.clipboard && window.ClipboardItem)
+    navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([html],{type:'text/html'}),'text/plain':new Blob([text],{type:'text/plain'})})]);
+  document.getElementById('cmpStatus').textContent='Copied the body (links kept). Subject: '+document.getElementById('cmpSubject').value;
 }
 
 async function setJobStatus(id,s){
@@ -7192,6 +7539,323 @@ setInterval(()=>{ if(!scanTimer) refresh(); }, 60000);   // auto-refresh so new 
 </body>
 </html>
 """
+
+
+# ─────────────────────────── cold reach-out composer ────────────────────────
+#  "Cold reach-out" on a job / post / startup card opens a Gmail-style composer in the dashboard.
+#  Generate → the Claude Code CLI on this Mac (`claude -p`) writes the email with the rules in your ColdEmail project
+#  (~/ClaudeProjects/ColdEmail/CLAUDE.md + Chetan_CV.pdf), researching the company the way that project does.
+#  Send / Save draft → your Gmail over SMTP / IMAP with a Gmail App Password (GMAIL_ADDRESS + GMAIL_APP_PASSWORD in .env).
+#  Every email is logged in the `outreach` table so the same address is never emailed twice by accident.
+#  Works only in the dashboard on your Mac (start.command); the public GitHub Pages copy can't hold a password.
+
+COLD_EMAIL_DIR     = Path(os.path.expanduser(os.environ.get("COLD_EMAIL_DIR", "~/ClaudeProjects/ColdEmail")))
+RESUME_PATH        = Path(os.path.expanduser(os.environ.get("RESUME_PATH", str(COLD_EMAIL_DIR / "Chetan_CV.pdf"))))
+GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS", "").strip()
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+GMAIL_FROM_NAME    = os.environ.get("GMAIL_FROM_NAME", "Chetan Sai")
+COLD_EMAIL_MODEL   = os.environ.get("COLD_EMAIL_MODEL", "sonnet")    # default model for writing emails (user choice 2026-11-28)
+COLD_EMAIL_EFFORT  = os.environ.get("COLD_EMAIL_EFFORT", "medium")
+COMPOSE_MODELS     = ("sonnet", "opus", "haiku")
+COMPOSE_EFFORTS    = ("low", "medium", "high", "xhigh", "max")
+_RECIPIENT_TYPES   = {"founder": "Founder / co-founder", "recruiter": "Recruiter / HR / talent acquisition",
+                      "referral": "Employee, for a referral"}
+
+
+def _claude_bin() -> str | None:
+    import shutil
+    return shutil.which("claude") or next((p for p in (os.path.expanduser("~/.local/bin/claude"), "/opt/homebrew/bin/claude",
+                                                       "/usr/local/bin/claude") if os.path.exists(p)), None)
+
+
+def compose_config() -> dict:
+    return {"local": True, "from": GMAIL_ADDRESS, "from_name": GMAIL_FROM_NAME,
+            "can_send": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
+            "can_generate": bool(_claude_bin() and (COLD_EMAIL_DIR / "CLAUDE.md").exists()),
+            "resume": RESUME_PATH.name if RESUME_PATH.exists() else "",
+            "rules": str(COLD_EMAIL_DIR / "CLAUDE.md"), "models": list(COMPOSE_MODELS), "efforts": list(COMPOSE_EFFORTS),
+            "model": COLD_EMAIL_MODEL, "effort": COLD_EMAIL_EFFORT}
+
+
+_MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def email_text_to_html(text: str) -> str:
+    """Plain email text from the writer → simple Gmail-friendly HTML: paragraphs, '- ' bullets, [word](url) links."""
+    import html as _h
+    def inline(s: str) -> str:
+        def plain(t: str) -> str:           # bare URLs (e.g. the "Job link:" line) become links too
+            return re.sub(r"https?://[^\s<]+[^\s<.,;:)]", lambda u: f'<a href="{u.group(0)}">{u.group(0)}</a>', _h.escape(t))
+        out, last = [], 0
+        for m in _MD_LINK.finditer(s):
+            out.append(plain(s[last:m.start()]))
+            out.append(f'<a href="{_h.escape(m.group(2), quote=True)}">{_h.escape(m.group(1))}</a>')
+            last = m.end()
+        out.append(plain(s[last:]))
+        return "".join(out)
+    blocks, cur = [], []
+    for line in text.replace("\r", "").split("\n"):
+        if line.strip():
+            cur.append(line.rstrip())
+        elif cur:
+            blocks.append(cur); cur = []
+    if cur:
+        blocks.append(cur)
+    html_parts = []
+    for b in blocks:
+        bullets = [l for l in b if re.match(r"\s*[-•*]\s+", l)]
+        if bullets and len(bullets) == len(b):
+            html_parts.append("<ul>" + "".join(f"<li>{inline(re.sub(r'^\s*[-•*]\s+', '', l))}</li>" for l in b) + "</ul>")
+        elif bullets:                         # a lead-in line followed by bullets
+            head = [l for l in b if l not in bullets]
+            html_parts.append("<p>" + "<br>".join(inline(l) for l in head) + "</p>")
+            html_parts.append("<ul>" + "".join(f"<li>{inline(re.sub(r'^\s*[-•*]\s+', '', l))}</li>" for l in bullets) + "</ul>")
+        else:
+            html_parts.append("<p>" + "<br>".join(inline(l) for l in b) + "</p>")
+    return "".join(html_parts)
+
+
+def email_html_to_text(html: str) -> str:
+    import html as _h
+    s = re.sub(r'<a [^>]*href="([^"]+)"[^>]*>(.*?)</a>', r"\2 (\1)", html, flags=re.S | re.I)
+    s = re.sub(r"<li[^>]*>", "- ", s, flags=re.I)
+    s = re.sub(r"</(p|ul|h\d)>", "\n\n", s, flags=re.I)
+    s = re.sub(r"</(div|li)>|<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = _h.unescape(s)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def _clean_email_html(html: str) -> str:
+    """The composer is contenteditable: keep text, links and lists, drop scripts, styles and event handlers."""
+    html = re.sub(r"<(script|style|iframe|object)[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
+    html = re.sub(r"\s(on\w+|style|class|id)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", html, flags=re.I)
+    html = re.sub(r'href\s*=\s*"\s*javascript:[^"]*"', 'href="#"', html, flags=re.I)
+    return html
+
+
+def generate_cold_email(p: dict) -> dict:
+    """Run `claude -p` inside the ColdEmail project folder so its CLAUDE.md rules (and the CV) apply as they do there."""
+    import subprocess
+    cfg = compose_config()
+    if not cfg["can_generate"]:
+        return {"ok": False, "error": "Claude Code CLI or ~/ClaudeProjects/ColdEmail/CLAUDE.md not found on this Mac"}
+    rtype = p.get("recipient_type") if p.get("recipient_type") in _RECIPIENT_TYPES else "recruiter"
+    first = (p.get("first_name") or "").strip()
+    ctx = (p.get("context") or "").strip()[:4000]
+    prompt = f"""Write one cold email following this project's CLAUDE.md rules exactly (recipient-type tone and closing ask,
+hard rules, style rules learned from feedback, under ~150 words, the links line, "Regards," / "Chetan Sai").
+
+Company: {p.get('company') or '(work it out from the job link / context)'}
+Role: {p.get('role') or '(work it out from the job link / context)'}
+Job link: {p.get('job_link') or '(none)'}
+Recipient type: {_RECIPIENT_TYPES[rtype]}
+Recipient first name: {first or ('(none: this is a shared inbox, so greet "Hi <Company> team")' if re.match(r"(hello|hi|careers?|jobs?|hr|hiring|talent|recruit\w*|people|team|info|contact)@", (p.get("to") or "").lower()) else '(unknown: greet with "Hi [First name]" so I can fill it in)')}
+Recipient email: {p.get('to') or '(not given)'}
+{('Context we already have (job post / hiring post text):' + chr(10) + ctx) if ctx else ''}
+
+Research the company as the project says (its site, product, recent news; read the job link if it helps).
+You are running headless inside the job dashboard, so ignore the "one-click copy" widget instructions and do not
+create any files. Reply with ONLY one JSON object, no code fence, no commentary:
+{{"subject": "...", "body": "plain-text email body; bullets start with '- '; the links line uses markdown [LinkedIn](url) | [GitHub](url) | [Portfolio](url)",
+  "company": "...", "role": "...", "flags": ["2-4 short 'before you send' flags"], "sources": ["urls you used"]}}"""
+    model = p.get("model") if p.get("model") in COMPOSE_MODELS else COLD_EMAIL_MODEL
+    effort = p.get("effort") if p.get("effort") in COMPOSE_EFFORTS else COLD_EMAIL_EFFORT
+    cmd = [_claude_bin(), "-p", prompt, "--output-format", "json", "--no-session-persistence",
+           "--allowedTools", "WebSearch", "WebFetch", "Read"]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    try:
+        r = subprocess.run(cmd, cwd=str(COLD_EMAIL_DIR), capture_output=True, text=True, timeout=300,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "the writer took over 5 minutes, try again"}
+    try:
+        out = json.loads(r.stdout)
+        text = out.get("result", "") if isinstance(out, dict) else ""
+        if isinstance(out, dict) and out.get("is_error"):
+            return {"ok": False, "error": (text or "Claude Code returned an error")[:300]}
+    except Exception:
+        return {"ok": False, "error": (r.stderr or r.stdout or "no output from claude")[-300:]}
+    m = re.search(r"\{.*\}", text, re.S)
+    try:
+        em = json.loads(m.group(0)) if m else None
+    except Exception:
+        em = None
+    if not em or not em.get("body"):
+        return {"ok": False, "error": "the writer didn't return an email", "raw": text[-1500:]}
+    body = str(em["body"]).strip()
+    return {"ok": True, "subject": str(em.get("subject", "")).strip(), "body_text": body,
+            "body_html": email_text_to_html(body), "company": em.get("company", ""), "role": em.get("role", ""),
+            "flags": [str(f) for f in (em.get("flags") or [])][:6], "sources": [str(s) for s in (em.get("sources") or [])][:8],
+            "model": model, "effort": effort, "cost_usd": out.get("total_cost_usd") if isinstance(out, dict) else None}
+
+
+def _build_message(to: str, subject: str, html: str, attach: bool):
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["From"] = email.utils.formataddr((GMAIL_FROM_NAME, GMAIL_ADDRESS))
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=GMAIL_ADDRESS.split("@")[-1] or "localhost")
+    msg.set_content(email_html_to_text(html))
+    msg.add_alternative(f'<div dir="ltr" style="font-family:Arial,sans-serif;font-size:14px">{html}</div>', subtype="html")
+    if attach and RESUME_PATH.exists():
+        msg.add_attachment(RESUME_PATH.read_bytes(), maintype="application", subtype="pdf", filename=RESUME_PATH.name)
+    return msg
+
+
+def _gmail_drafts_box(imap) -> str:
+    typ, boxes = imap.list()
+    for b in boxes or []:
+        line = b.decode(errors="replace") if isinstance(b, bytes) else str(b)
+        if "\\Drafts" in line:
+            name = line.rsplit(' "/" ', 1)[-1].strip()
+            return name if name.startswith('"') else f'"{name}"'
+    return '"[Gmail]/Drafts"'
+
+
+_EMAIL_OK = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[a-z]{2,}$", re.I)
+
+
+def send_cold_email(p: dict) -> dict:
+    """mode 'send' → SMTP (Gmail keeps a copy in Sent); mode 'draft' → IMAP APPEND into Gmail Drafts."""
+    import smtplib
+    import imaplib
+    import time as _t
+    if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD):
+        return {"ok": False, "error": "set GMAIL_ADDRESS and GMAIL_APP_PASSWORD in .env, then restart the dashboard"}
+    to, subject = (p.get("to") or "").strip(), (p.get("subject") or "").strip()
+    html = _clean_email_html(p.get("body_html") or "")
+    mode = "draft" if p.get("mode") == "draft" else "send"
+    if not _EMAIL_OK.match(to):
+        return {"ok": False, "error": "the To address doesn't look like one email address"}
+    if not subject or len(email_html_to_text(html)) < 20:
+        return {"ok": False, "error": "subject or body is empty"}
+    conn = get_db()
+    prev = conn.execute("SELECT at, mode FROM outreach WHERE lower(to_email)=lower(?) AND mode='sent' ORDER BY id DESC LIMIT 1",
+                        (to,)).fetchone()
+    if prev and mode == "send" and not p.get("confirm_repeat"):
+        conn.close()
+        return {"ok": False, "repeat": True, "error": f"you already emailed {to} on {prev['at'][:10]}"}
+    msg = _build_message(to, subject, html, bool(p.get("attach_resume", True)))
+    try:
+        if mode == "send":
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=40) as s:
+                s.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                s.send_message(msg)
+        else:
+            im = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=40)
+            try:
+                im.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                typ, resp = im.append(_gmail_drafts_box(im), "(\\Draft)", imaplib.Time2Internaldate(_t.time()), msg.as_bytes())
+                if typ != "OK":
+                    raise RuntimeError(f"Gmail refused the draft: {resp}")
+            finally:
+                try: im.logout()
+                except Exception: pass
+    except smtplib.SMTPAuthenticationError:
+        conn.close()
+        return {"ok": False, "error": "Gmail rejected the login: check GMAIL_APP_PASSWORD (an App Password, not your normal password)"}
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    ref = p.get("ref") or {}
+    conn.execute("INSERT INTO outreach (ref_type, ref_id, company, role, job_link, to_email, recipient_type, first_name, "
+                 "subject, mode, at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                 (str(ref.get("type", "")), str(ref.get("id", "")), p.get("company", ""), p.get("role", ""),
+                  p.get("job_link", ""), to, p.get("recipient_type", ""), p.get("first_name", ""), subject,
+                  "sent" if mode == "send" else "draft", now_utc()))
+    if mode == "send":                     # posts and startups have a "contacted" status; jobs keep theirs (you may still apply)
+        if ref.get("type") == "post" and str(ref.get("id", "")).isdigit():
+            conn.execute("UPDATE posts SET status='contacted' WHERE id=?", (int(ref["id"]),))
+        elif ref.get("type") == "startup":
+            conn.execute("UPDATE startups SET status='contacted' WHERE key=?", (str(ref.get("id")),))
+    conn.commit(); conn.close()
+    return {"ok": True, "mode": "sent" if mode == "send" else "draft"}
+
+
+# ── the same composer from the GitHub Pages dashboard ───────────────────────
+#  The public page can't hold secrets, so it starts the "compose" GitHub Actions workflow with an ENCRYPTED request
+#  (key = COMPOSE_KEY: a repo secret + typed once into the dashboard). The runner unpacks the encrypted ColdEmail kit
+#  (compose/kit.enc: your CLAUDE.md rules + resume), runs the same generate / send code, and writes the encrypted
+#  result to the `compose` branch, where the page picks it up. Nothing readable ever lands in the public repo.
+COMPOSE_KIT = BASE_DIR / "compose" / "kit.enc"
+_REQ_OK = re.compile(r"^[a-z0-9-]{8,40}$")
+
+
+def _decrypt_payload(blob: dict, password: str) -> object:
+    import base64
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    d = lambda x: base64.b64decode(x)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), d(blob["salt"]), int(blob.get("iter", 250_000)), 32)
+    return json.loads(AESGCM(key).decrypt(d(blob["iv"]), d(blob["ct"]), None).decode("utf-8"))
+
+
+def pack_compose_kit() -> bool:
+    """Encrypt ~/ClaudeProjects/ColdEmail/CLAUDE.md + the resume into compose/kit.enc for the cloud composer."""
+    key = os.environ.get("COMPOSE_KEY", "")
+    rules_f = COLD_EMAIL_DIR / "CLAUDE.md"
+    if not key or not rules_f.exists() or not RESUME_PATH.exists():
+        print(f"need COMPOSE_KEY in .env, {rules_f} and {RESUME_PATH}")
+        return False
+    import base64
+    kit = {"rules": rules_f.read_text(), "resume_name": RESUME_PATH.name,
+           "resume_b64": base64.b64encode(RESUME_PATH.read_bytes()).decode(), "packed": now_utc()}
+    COMPOSE_KIT.parent.mkdir(exist_ok=True)
+    COMPOSE_KIT.write_text(json.dumps(_encrypt_payload(kit, key)))
+    print(f"packed {rules_f.name} + {RESUME_PATH.name} → {COMPOSE_KIT} (encrypted)")
+    return True
+
+
+def compose_run(out_path: str) -> None:
+    """GitHub Actions entry point: decrypt the request, run generate / send, write the encrypted result."""
+    import base64
+    import tempfile
+    key, req = os.environ.get("COMPOSE_KEY", ""), os.environ.get("COMPOSE_REQ", "")
+    def done(res: dict) -> None:
+        body = json.dumps(_encrypt_payload(res, key)) if key else json.dumps({"ok": False, "error": res.get("error", "")})
+        Path(out_path).write_text(body)
+    if not key:
+        return done({"ok": False, "error": "the COMPOSE_KEY repo secret is missing: run setup_cloud_composer.sh on your Mac"})
+    if not _REQ_OK.match(req):
+        return done({"ok": False, "error": "bad request id"})
+    try:
+        p = _decrypt_payload(json.loads(os.environ.get("COMPOSE_PAYLOAD", "{}")), key)
+    except Exception:
+        return done({"ok": False, "error": "couldn't decrypt the request: the compose key in the dashboard doesn't match the repo secret"})
+    if not isinstance(p, dict) or p.get("req") != req:
+        return done({"ok": False, "error": "request id mismatch"})
+    try:
+        kit = _decrypt_payload(json.loads(COMPOSE_KIT.read_text()), key)
+    except Exception:
+        return done({"ok": False, "error": "compose/kit.enc is missing or was packed with another key: run setup_cloud_composer.sh --kit"})
+    tmp = Path(tempfile.mkdtemp(prefix="coldemail-"))
+    (tmp / "CLAUDE.md").write_text(kit["rules"])
+    (tmp / kit.get("resume_name", "resume.pdf")).write_bytes(base64.b64decode(kit["resume_b64"]))
+    g = globals()
+    g["COLD_EMAIL_DIR"], g["RESUME_PATH"] = tmp, tmp / kit.get("resume_name", "resume.pdf")
+    g["DB_PATH"] = tmp / "compose.db"                 # throwaway: the outreach log lives in your browser, not the public repo
+    init_db()
+    action = p.get("action")
+    if action == "generate":
+        res = generate_cold_email(p)
+    elif action in ("send", "draft"):
+        res = send_cold_email({**p, "mode": action, "confirm_repeat": True})   # repeat check runs in the browser
+    else:
+        res = {"ok": False, "error": f"unknown action {action!r}"}
+    res["kit_packed"] = kit.get("packed", "")
+    done(res)
+
+
+def outreach_log() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT ref_type, ref_id, to_email, subject, mode, at FROM outreach ORDER BY id DESC LIMIT 2000").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ─────────────────────────── HTTP server ────────────────────────────────────
@@ -7280,6 +7944,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(dict(SCAN_STATE))
             return
 
+        if path == "/api/compose/config":
+            self._json(compose_config())
+            return
+
+        if path == "/api/outreach":
+            self._json(outreach_log())
+            return
+
         # Serve dashboard for all other GET paths
         body = DASHBOARD_HTML.encode()
         self.send_response(200)
@@ -7328,6 +8000,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": res.get("error", "sync failed")})
             return
 
+        if self.path == "/api/compose/generate":
+            self._json(generate_cold_email(payload))
+            return
+
+        if self.path == "/api/compose/send":
+            self._json(send_cold_email(payload))
+            return
+
         if self.path == "/api/scan":
             started = start_scan_async(payload.get("urls"))
             self._json({"started": started, "running": SCAN_STATE["running"]})
@@ -7351,10 +8031,18 @@ def main() -> None:
     parser.add_argument("--discover",   action="store_true", help="Run the daily discovery step now and exit")
     parser.add_argument("--startups",   action="store_true", help="Collect + enrich funded startups and exit")
     parser.add_argument("--posts",      action="store_true", help="Pull + vet hiring posts only (LinkedIn via Apify) and exit")
+    parser.add_argument("--compose-run", metavar="OUT", help="(GitHub Actions) run one encrypted composer request, write the result to OUT")
+    parser.add_argument("--pack-compose-kit", action="store_true", help="Encrypt the ColdEmail rules + resume into compose/kit.enc")
     parser.add_argument("--port",       type=int, default=SERVE_PORT)
     parser.add_argument("--host",       default=SERVE_HOST,
                         help="Bind host (use 0.0.0.0 for cloud/public access)")
     args = parser.parse_args()
+
+    if args.compose_run:
+        compose_run(args.compose_run)
+        return
+    if args.pack_compose_kit:
+        sys.exit(0 if pack_compose_kit() else 1)
 
     init_db()
 
