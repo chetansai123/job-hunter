@@ -47,17 +47,16 @@ try:
     import certifi; ctx = ssl.create_default_context(cafile=certifi.where())
 except Exception:
     ctx = ssl.create_default_context()
+import base64
 try:
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=25) as s:
-        s.login(os.environ["GA"], os.environ["GP"])
-    print("ok")
-except smtplib.SMTPAuthenticationError:
-    print("bad")
-except Exception as e:
+    s = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=25); s.ehlo()
+    code, _ = s.docmd("AUTH", "PLAIN " + base64.b64encode(f"\0{os.environ['GA']}\0{os.environ['GP']}".encode()).decode())
+    print("ok" if code == 235 else "bad")
+except Exception:
     print("unreachable")
 EOF
 )
-    [ "$CHECK" = "bad" ] && { echo "Gmail rejected it. Make sure the App Password was created for $GA, then try again."; continue; }
+    [ "$CHECK" = "bad" ] && { echo "Gmail rejected it: this App Password does not belong to $GA. In the browser, switch to $GA (top-right picture), create a new App Password there, and paste that."; continue; }
     [ "$CHECK" = "unreachable" ] && echo "(couldn't reach Gmail from this network to check it; saving anyway)"
     [ "$CHECK" = "ok" ] && echo "Gmail accepted it."
     break
@@ -76,14 +75,14 @@ if [ "$1" != "--kit" ] && [ "$1" != "--gmail" ]; then
     echo "Paste the token (hidden; both lines are fine), then press Enter on an EMPTY line:"
     CT=""
     while IFS= read -r -s line; do [ -z "$line" ] && break; CT="$CT$line"; done
-    CT=$(printf '%s' "$CT" | tr -d '[:space:]')
-    echo "Checking the token with Claude (a few seconds)..."
-    if CLAUDE_CODE_OAUTH_TOKEN="$CT" ANTHROPIC_API_KEY= claude -p "Reply with the word ok" --model haiku --no-session-persistence >/dev/null 2>&1; then
+    # keep only the token itself: stray characters, spaces and line breaks around or inside the paste are dropped
+    CT=$(printf '%s' "$CT" | LC_ALL=C tr -cd 'A-Za-z0-9_-' | LC_ALL=C grep -Eo 'sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]{40,}' | head -1)
+    if [ -n "$CT" ]; then
       printf '%s' "$CT" | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO"
-      echo "Token works and is saved."
+      echo "Token saved (${#CT} characters, starts sk-ant-oat). Claude will confirm it works on the first cloud run."
       break
     fi
-    echo "That token didn't work (got ${#CT} characters). Copy it again, both lines."
+    echo "That paste doesn't contain a token starting with sk-ant-oat. Copy it again, both lines."
   done
 fi
 

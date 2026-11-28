@@ -7757,9 +7757,10 @@ def send_cold_email(p: dict) -> dict:
             finally:
                 try: im.logout()
                 except Exception: pass
-    except smtplib.SMTPAuthenticationError:
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPServerDisconnected):
         conn.close()
-        return {"ok": False, "error": "Gmail rejected the login: check GMAIL_APP_PASSWORD (an App Password, not your normal password)"}
+        return {"ok": False, "error": "Gmail rejected the login: the App Password must be created while signed in to "
+                                      f"{GMAIL_ADDRESS} (run ./setup_cloud_composer.sh --gmail)"}
     except Exception as e:
         conn.close()
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
@@ -7845,9 +7846,10 @@ def compose_run(out_path: str) -> None:
         res = {"ok": True, "gmail": "", "claude": ""}
         try:
             import smtplib
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as sm:
-                sm.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            res["gmail"] = "ok"
+            import base64
+            sm = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30); sm.ehlo()
+            code, msg = sm.docmd("AUTH", "PLAIN " + base64.b64encode(f"\0{GMAIL_ADDRESS}\0{GMAIL_APP_PASSWORD}".encode()).decode())
+            res["gmail"] = "ok" if code == 235 else f"{code} {msg.decode(errors='replace')[:90]}"
         except Exception as e:
             res["gmail"] = f"{type(e).__name__}: {str(e)[:160]}"
         import subprocess
