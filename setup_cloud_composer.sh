@@ -3,6 +3,8 @@
 #
 #   ./setup_cloud_composer.sh          full setup: compose key, Gmail, Claude token, encrypted rules + resume
 #   ./setup_cloud_composer.sh --kit    only re-pack ~/ClaudeProjects/ColdEmail (CLAUDE.md + resume) after you change them
+#   ./setup_cloud_composer.sh --claude only redo the Claude token (it is checked before it is saved)
+#   ./setup_cloud_composer.sh --gmail  only redo the Gmail address + App Password (checked before it is saved)
 #
 # Secrets go straight from your keyboard into GitHub repo secrets (gh secret set) and your git-ignored .env.
 set -e
@@ -26,23 +28,66 @@ if ! grep -q '^COMPOSE_KEY=' .env 2>/dev/null; then
 fi
 KEY=$(grep '^COMPOSE_KEY=' .env | tail -1 | cut -d= -f2-)
 
-if [ "$1" != "--kit" ]; then
+if [ "$1" != "--kit" ] && [ "$1" != "--claude" ]; then
   printf '%s' "$KEY" | gh secret set COMPOSE_KEY --repo "$REPO"
   echo
   echo "Gmail: turn on 2-Step Verification, then create an App Password at https://myaccount.google.com/apppasswords"
   read -r -p "Gmail address to send from: " GA
-  read -r -s -p "Gmail App Password (16 letters; typing is hidden): " GP; echo
-  GP=${GP// /}
+  while true; do
+    read -r -s -p "Gmail App Password (16 letters; typing is hidden; paste ONCE, then Enter): " GP; echo
+    GP=$(printf '%s' "$GP" | tr -d '[:space:]')
+    if ! printf '%s' "$GP" | grep -Eq '^[A-Za-z]{16}$'; then
+      echo "That was ${#GP} characters. An App Password is exactly 16 letters (e.g. 'abcd efgh ijkl mnop'). Try again."
+      continue
+    fi
+    echo "Checking it with Gmail (logs in only, sends nothing)..."
+    CHECK=$(GA="$GA" GP="$GP" python3 - <<'EOF'
+import os, smtplib, ssl
+try:
+    import certifi; ctx = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    ctx = ssl.create_default_context()
+try:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=25) as s:
+        s.login(os.environ["GA"], os.environ["GP"])
+    print("ok")
+except smtplib.SMTPAuthenticationError:
+    print("bad")
+except Exception as e:
+    print("unreachable")
+EOF
+)
+    [ "$CHECK" = "bad" ] && { echo "Gmail rejected it. Make sure the App Password was created for $GA, then try again."; continue; }
+    [ "$CHECK" = "unreachable" ] && echo "(couldn't reach Gmail from this network to check it; saving anyway)"
+    [ "$CHECK" = "ok" ] && echo "Gmail accepted it."
+    break
+  done
   printf '%s' "$GA" | gh secret set GMAIL_ADDRESS --repo "$REPO"
   printf '%s' "$GP" | gh secret set GMAIL_APP_PASSWORD --repo "$REPO"
   set_env GMAIL_ADDRESS "$GA"; set_env GMAIL_APP_PASSWORD "$GP"     # the dashboard on your Mac uses them too
-  echo
-  echo "Claude: 'claude setup-token' opens your browser to sign in to your Claude plan and then prints a long token."
-  claude setup-token
-  read -r -s -p "Paste that token here (hidden): " CT; echo
-  printf '%s' "$CT" | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO"
 fi
 
+if [ "$1" != "--kit" ] && [ "$1" != "--gmail" ]; then
+  echo
+  echo "Claude: 'claude setup-token' opens your browser to sign in to your Claude plan and then prints a long token."
+  echo "The token is printed over TWO lines. Select from 'sk-ant-oat' to the end of the second line and copy both lines."
+  claude setup-token
+  while true; do
+    echo "Paste the token (hidden; both lines are fine), then press Enter on an EMPTY line:"
+    CT=""
+    while IFS= read -r -s line; do [ -z "$line" ] && break; CT="$CT$line"; done
+    CT=$(printf '%s' "$CT" | tr -d '[:space:]')
+    echo "Checking the token with Claude (a few seconds)..."
+    if CLAUDE_CODE_OAUTH_TOKEN="$CT" ANTHROPIC_API_KEY= claude -p "Reply with the word ok" --model haiku --no-session-persistence >/dev/null 2>&1; then
+      printf '%s' "$CT" | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO"
+      echo "Token works and is saved."
+      break
+    fi
+    echo "That token didn't work (got ${#CT} characters). Copy it again, both lines."
+  done
+fi
+
+[ "$1" = "--claude" ] || [ "$1" = "--gmail" ] && { echo "Done."; exit 0; }
 COMPOSE_KEY="$KEY" python3 job_hunter.py --pack-compose-kit
 git add compose/kit.enc
 git commit -q -m "Update the encrypted cold-email kit (rules + resume)" -- compose/kit.enc || echo "(kit unchanged)"
