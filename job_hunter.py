@@ -2215,6 +2215,8 @@ def _reddit_to_post(p: dict, sub: str, rules: dict, max_days: int) -> dict | Non
     if re.search(r"\[for hire\]|\[for-hire\]|\[task\]|\bfor hire\b|\[(?:discussion|question|meta|advice|help|rant|news)\]", tl) \
             or "looking for work" in low or tl.rstrip().endswith("?"):
         return None
+    if len(re.sub(r"\[[^\]]*\]\([^)]*\)|https?://\S+", "", body).strip()) < 80:
+        return None                                    # title-only / link-only post: no role details, nothing to judge
     if not re.search(r"\bhiring\b|\[hiring\]|looking for (?:a|an|\d+)\b|\bneed (?:a|an)\b|seeking (?:a|an)\b|\bopening|\bvacanc|position\b|join (?:our|us)", tl):
         return None                                    # the title must announce an opening, not discuss the job market
     created = p.get("created_utc") or 0
@@ -2550,8 +2552,8 @@ _ROLE_AFTER = re.compile(r"(?:hiring|looking for|seeking|role|position|opening|v
 def _role_text(low: str) -> str:
     """The role being hired, not the company blurb: phrases after 'hiring / role: / position:' plus the first line."""
     first = low.strip().split("\n", 1)[0][:160]
-    if first.count("|") >= 2:                          # HN / sheet style "Company | Role | Location | …": the role is the 2nd field
-        return " | ".join(first.split("|")[1:3])
+    if first.count("|") >= 2:                          # HN / sheet / Reddit style "Company | Role | Location | …": the title line itself
+        return " | ".join(first.split("|")[:3])
     roles = [m.group(1) for m in _ROLE_AFTER.finditer(low[:700])]
     return " | ".join(roles) if roles else first
 _FIRST_PERSON_SEEKER = re.compile(r"\babout me\b|\bi had been\b|\bi was laid off\b|laid off|\bmy (?:experience|skills|resume|cv|portfolio|projects)\b|"
@@ -2617,6 +2619,10 @@ def vet_post(p: dict, rules: dict) -> tuple[bool, str]:
     if _ENGAGEMENT_BAIT.search(low):
         return False, "engagement-bait post (comment / follow for more)"
     src, role = str(p.get("source", "")), (p.get("poster_role") or "")
+    if src.startswith("Reddit"):
+        body = (p.get("post_text") or "").split("\n\n", 1)[1] if "\n\n" in (p.get("post_text") or "") else ""
+        if len(re.sub(r"\[[^\]]*\]\([^)]*\)|https?://\S+", "", body).strip()) < 80:
+            return False, "title-only / link-only post (no role details)"
     if src in ("LinkedIn", "X/Twitter") and role != "Company page":
         own = re.search(r"\b(?:we|we're|our|us|my team|i'm hiring|i am hiring|i'm looking|i am looking|dm me|message me|ping me|refer)\b", low[:700])
         if _THIRD_PERSON_SHARE.search(low[:300]) and not re.search(r"\b(?:we|we're|our|my team)\b", low[:700]):
